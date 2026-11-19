@@ -1,0 +1,42 @@
+{
+  "fragment8": {
+    "role": "fragment8",
+    "fileName": "1794927035869_0alymm.mp4",
+    "originalName": "fragment8.mp4",
+    "url": "/uploads/1794927035869_0alymm.mp4",
+    "filePath": "/app/applet/storage/uploads/1794927035869_0alymm.mp4",
+    "probe": {
+      "durationSec": 275.72,
+      "width": 720,
+      "height": 540,
+      "fps": 25,
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoCodec": "h264",
+      "audioCodec": "aac",
+      "sampleRate": 48000,
+      "sizeBytes": 31101952
+    },
+    "warnings": []
+  },
+  "fragment9": {
+    "role": "fragment9",
+    "fileName": "1794927035875_onawn0.mp4",
+    "originalName": "fragment9.mp4",
+    "url": "/uploads/1794927035875_onawn0.mp4",
+    "filePath": "/app/applet/storage/uploads/1794927035875_onawn0.mp4",
+    "probe": {
+      "durationSec": 275.72,
+      "width": 720,
+      "height": 540,
+      "fps": 25,
+      "hasVideo": true,
+      "hasAudio": true,
+      "videoCodec": "h264",
+      "audioCodec": "aac",
+      "sampleRate": 48000,
+      "sizeBytes": 31101952
+    },
+    "warnings": []
+  }
+}

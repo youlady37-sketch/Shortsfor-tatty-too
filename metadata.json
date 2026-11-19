@@ -1,0 +1,6 @@
+{
+  "name": "ДЕЛО В КАДРЕ — Shorts Studio",
+  "description": "Монтажная студия для сборки вертикальных видео YouTube Shorts (9:16, 1080×1920, H.264/AAC) для канала «ДЕЛО В КАДРЕ» с субтитрами, звуковым логотипом, экспортом версий А/Б и генерацией обложек.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

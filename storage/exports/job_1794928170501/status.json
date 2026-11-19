@@ -1,0 +1,53 @@
+{
+  "jobId": "job_1794928170501",
+  "status": "completed",
+  "stageIndex": 6,
+  "totalStages": 6,
+  "stageLabel": "Экспорт завершён",
+  "detail": "Готовы файлы Версия А и Версия Б (MP4, H.264/AAC)",
+  "startedAt": "2026-11-17T15:09:30.501Z",
+  "updatedAt": "2026-11-17T15:16:03.460Z",
+  "result": {
+    "jobId": "job_1794928170501",
+    "createdAt": "2026-11-17T15:09:30.501Z",
+    "mainDurationSec": 57.08,
+    "endplateDurationSec": 2,
+    "totalDurationSec": 59.08,
+    "versionA": {
+      "version": "A",
+      "title": "Версия А — основная (MP4, H.264/AAC, речь + музыка + звуковой логотип)",
+      "url": "/api/download-export/job_1794928170501/version_a.mp4",
+      "fileName": "delo_v_kadre_short_01_version_A.mp4",
+      "probe": {
+        "durationSec": 59.08,
+        "width": 1080,
+        "height": 1920,
+        "fps": 25,
+        "hasVideo": true,
+        "hasAudio": true,
+        "videoCodec": "h264",
+        "audioCodec": "aac",
+        "sampleRate": 48000,
+        "sizeBytes": 43830004
+      }
+    },
+    "versionB": {
+      "version": "B",
+      "title": "Версия Б — без музыки (MP4, H.264/AAC, речь + тишина на заставке)",
+      "url": "/api/download-export/job_1794928170501/version_b.mp4",
+      "fileName": "delo_v_kadre_short_01_version_B.mp4",
+      "probe": {
+        "durationSec": 59.08,
+        "width": 1080,
+        "height": 1920,
+        "fps": 25,
+        "hasVideo": true,
+        "hasAudio": true,
+        "videoCodec": "h264",
+        "audioCodec": "aac",
+        "sampleRate": 48000,
+        "sizeBytes": 43781475
+      }
+    }
+  }
+}
