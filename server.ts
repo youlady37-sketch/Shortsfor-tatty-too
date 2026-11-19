@@ -49,7 +49,9 @@ import type {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const STORAGE_DIR = path.join(__dirname, 'storage');
+const STORAGE_DIR = process.env.STUDIO_STORAGE_DIR
+  ? path.resolve(process.env.STUDIO_STORAGE_DIR)
+  : path.join(__dirname, 'storage');
 const UPLOADS_DIR = path.join(STORAGE_DIR, 'uploads');
 const EXPORTS_DIR = path.join(STORAGE_DIR, 'exports');
 const TEMP_DIR = path.join(STORAGE_DIR, 'temp');
@@ -1547,13 +1549,23 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distDir = path.join(__dirname, 'dist');
-    app.use(express.static(distDir));
+    const distIndexPath = path.join(distDir, 'index.html');
+    app.use(
+      express.static(distDir, {
+        setHeaders: (res, filePath) => {
+          if (path.resolve(filePath) === path.resolve(distIndexPath)) {
+            res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+          }
+        },
+      }),
+    );
     app.get('/{*path}', (_req, res) => {
-      res.sendFile(path.join(distDir, 'index.html'));
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+      res.sendFile(distIndexPath);
     });
   }
 
-  const port = 3000;
+  const port = Number(process.env.STUDIO_PORT) || 3000;
   const server = app.listen(port, '0.0.0.0', () => {
     console.log(`Server listening on http://0.0.0.0:${port}`);
   });

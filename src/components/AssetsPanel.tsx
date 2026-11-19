@@ -141,7 +141,7 @@ export const AssetsPanel: React.FC<AssetsPanelProps> = ({
   const [uploadingRole, setUploadingRole] = useState<SourceRole | null>(null);
   const [uploadPercent, setUploadPercent] = useState<number>(0);
   const [uploadError, setUploadError] = useState<string | null>(null);
-  const [assignBothVideoSlots, setAssignBothVideoSlots] = useState<boolean>(true);
+  const [assignBothVideoSlots, setAssignBothVideoSlots] = useState<boolean>(false);
   const [linkingRole, setLinkingRole] = useState<'fragment8' | 'fragment9' | null>(null);
   const [preloadedFilter, setPreloadedFilter] = useState<PreloadedFilterKey>('all');
 
@@ -265,7 +265,13 @@ export const AssetsPanel: React.FC<AssetsPanelProps> = ({
         </div>
       )}
 
-      <label className="flex items-start gap-2.5 p-3 bg-[#121826] border border-[#1F2937] rounded-lg text-xs text-slate-300 cursor-pointer select-none">
+      <label
+        className={`flex items-start gap-2.5 p-3 rounded-lg text-xs cursor-pointer select-none border transition-colors ${
+          assignBothVideoSlots
+            ? 'bg-amber-950/25 border-amber-700/60 text-amber-100'
+            : 'bg-[#121826] border-[#1F2937] text-slate-300'
+        }`}
+      >
         <input
           type="checkbox"
           checked={assignBothVideoSlots}
@@ -276,9 +282,15 @@ export const AssetsPanel: React.FC<AssetsPanelProps> = ({
           <span className="font-medium text-slate-100">
             Подключать загружаемый MP4 сразу к обоим монтажным слотам («Фрагмент 8» и «Фрагмент 9»)
           </span>
-          <span className="block text-[11px] text-slate-400 mt-0.5">
-            Удобно, если вы загружаете один исходный файл с компьютера для всех сцен на таймлайне. Снимите отметку, чтобы загрузить два разных видеофайла отдельно.
-          </span>
+          {assignBothVideoSlots ? (
+            <span className="block text-[11px] text-amber-300 mt-0.5">
+              Внимание: загружаемый файл будет назначен одновременно обоим монтажным слотам и заменит их текущие исходники.
+            </span>
+          ) : (
+            <span className="block text-[11px] text-slate-400 mt-0.5">
+              По умолчанию выключено: загрузка в «Фрагмент 8» и «Фрагмент 9» обновляет только выбранный слот, не затрагивая второй.
+            </span>
+          )}
         </span>
       </label>
 
