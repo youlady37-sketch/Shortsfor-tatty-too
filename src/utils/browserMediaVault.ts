@@ -3,13 +3,15 @@ import type {
   AdAudioAssetInfo,
   AdPreset,
   BrowserVaultDiagnostics,
+  SourceLibraryItem,
   SourceRole,
   VaultSaveResult,
 } from '../types.ts';
 
 const DB_NAME = 'delo_v_kadre_media_vault_v1';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const SOURCES_STORE = 'sources';
+const LIBRARY_SOURCES_STORE = 'librarySources';
 const EXPORTS_STORE = 'exports';
 const ADS_STORE = 'ads';
 const AD_PRESETS_STORE = 'adPresets';
@@ -35,6 +37,16 @@ export interface VaultSourceRecord {
   sizeBytes: number;
   mimeType: string;
   savedAt: string;
+  blob: Blob;
+}
+
+export interface VaultLibrarySourceRecord {
+  id: string;
+  originalName: string;
+  sizeBytes: number;
+  mimeType: string;
+  savedAt: string;
+  item?: SourceLibraryItem;
   blob: Blob;
 }
 
@@ -229,6 +241,9 @@ function openVaultDb(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(SOURCES_STORE)) {
         db.createObjectStore(SOURCES_STORE, { keyPath: 'role' });
       }
+      if (!db.objectStoreNames.contains(LIBRARY_SOURCES_STORE)) {
+        db.createObjectStore(LIBRARY_SOURCES_STORE, { keyPath: 'id' });
+      }
       if (!db.objectStoreNames.contains(EXPORTS_STORE)) {
         db.createObjectStore(EXPORTS_STORE, { keyPath: 'key' });
       }
@@ -250,7 +265,7 @@ function openVaultDb(): Promise<IDBDatabase> {
 function commitPutTransaction(
   db: IDBDatabase,
   storeName: string,
-  record: VaultSourceRecord | VaultExportRecord | VaultAdRecord,
+  record: VaultSourceRecord | VaultLibrarySourceRecord | VaultExportRecord | VaultAdRecord,
   context: string,
 ): Promise<VaultSaveResult> {
   return new Promise((resolve) => {
@@ -416,6 +431,114 @@ export async function listSourcesInVault(): Promise<
           originalName: item.originalName,
           sizeBytes: item.blob.size,
           savedAt: item.savedAt,
+        };
+      }
+    }
+    return map;
+  } catch {
+    return {};
+  } finally {
+    db?.close();
+  }
+}
+
+export async function saveLibrarySourceToVault(
+  item: SourceLibraryItem,
+  file: File | Blob,
+): Promise<VaultSaveResult> {
+  const context = `Резервирование видео «${item.originalName}»`;
+  if (!file || file.size <= 0) {
+    return { ok: false, error: `${context}: файл пуст.` };
+  }
+  await ensurePersistentStorage();
+  const quotaCheck = await checkQuotaBeforeWrite(file.size);
+  if (!quotaCheck.ok) {
+    return quotaCheck;
+  }
+
+  let db: IDBDatabase | null = null;
+  try {
+    db = await openVaultDb();
+    const record: VaultLibrarySourceRecord = {
+      id: item.id,
+      originalName: item.originalName,
+      sizeBytes: file.size,
+      mimeType: file.type || item.mimeType || 'video/mp4',
+      savedAt: new Date().toISOString(),
+      item,
+      blob: file,
+    };
+    return await commitPutTransaction(db, LIBRARY_SOURCES_STORE, record, context);
+  } catch (err) {
+    return classifyIndexedDbError(err, context);
+  } finally {
+    db?.close();
+  }
+}
+
+export async function getLibrarySourceFromVault(
+  id: string,
+): Promise<VaultLibrarySourceRecord | null> {
+  let db: IDBDatabase | null = null;
+  try {
+    db = await openVaultDb();
+    if (!db.objectStoreNames.contains(LIBRARY_SOURCES_STORE)) return null;
+    const rec = await new Promise<VaultLibrarySourceRecord | null>((resolve, reject) => {
+      const tx = db!.transaction(LIBRARY_SOURCES_STORE, 'readonly');
+      const req = tx.objectStore(LIBRARY_SOURCES_STORE).get(id);
+      req.onsuccess = () => resolve((req.result as VaultLibrarySourceRecord | undefined) ?? null);
+      req.onerror = () => reject(req.error);
+      tx.onabort = () => reject(tx.error);
+    });
+    if (!rec || !rec.blob || rec.blob.size <= 0) return null;
+    return rec;
+  } catch {
+    return null;
+  } finally {
+    db?.close();
+  }
+}
+
+export async function deleteLibrarySourceFromVault(id: string): Promise<void> {
+  let db: IDBDatabase | null = null;
+  try {
+    db = await openVaultDb();
+    if (!db.objectStoreNames.contains(LIBRARY_SOURCES_STORE)) return;
+    await new Promise<void>((resolve, reject) => {
+      const tx = db!.transaction(LIBRARY_SOURCES_STORE, 'readwrite');
+      tx.objectStore(LIBRARY_SOURCES_STORE).delete(id);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
+    });
+  } catch {
+    // ignore deletion failure
+  } finally {
+    db?.close();
+  }
+}
+
+export async function listLibrarySourcesInVault(): Promise<
+  Record<string, { originalName: string; sizeBytes: number; savedAt: string }>
+> {
+  let db: IDBDatabase | null = null;
+  try {
+    db = await openVaultDb();
+    if (!db.objectStoreNames.contains(LIBRARY_SOURCES_STORE)) return {};
+    const all = await new Promise<VaultLibrarySourceRecord[]>((resolve, reject) => {
+      const tx = db!.transaction(LIBRARY_SOURCES_STORE, 'readonly');
+      const req = tx.objectStore(LIBRARY_SOURCES_STORE).getAll();
+      req.onsuccess = () => resolve((req.result as VaultLibrarySourceRecord[]) ?? []);
+      req.onerror = () => reject(req.error);
+      tx.onabort = () => reject(tx.error);
+    });
+    const map: Record<string, { originalName: string; sizeBytes: number; savedAt: string }> = {};
+    for (const rec of all) {
+      if (rec.blob && rec.blob.size > 0) {
+        map[rec.id] = {
+          originalName: rec.originalName,
+          sizeBytes: rec.blob.size,
+          savedAt: rec.savedAt,
         };
       }
     }
@@ -812,8 +935,9 @@ export async function inspectIndexedDbVaultSummary(): Promise<{
         req.onerror = () => reject(req.error);
       });
 
-    const [sources, exportsList, ads, presets] = await Promise.all([
+    const [sources, libSources, exportsList, ads, presets] = await Promise.all([
       readStore<VaultSourceRecord>(SOURCES_STORE),
+      readStore<VaultLibrarySourceRecord>(LIBRARY_SOURCES_STORE),
       readStore<VaultExportRecord>(EXPORTS_STORE),
       readStore<VaultAdRecord>(ADS_STORE),
       readStore<VaultAdPresetRecord>(AD_PRESETS_STORE),
@@ -821,11 +945,12 @@ export async function inspectIndexedDbVaultSummary(): Promise<{
 
     const totalBytes =
       sources.reduce((a, s) => a + (s.blob?.size ?? 0), 0) +
+      libSources.reduce((a, s) => a + (s.blob?.size ?? 0), 0) +
       exportsList.reduce((a, e) => a + (e.blob?.size ?? 0), 0) +
       ads.reduce((a, ad) => a + (ad.blob?.size ?? 0), 0);
 
     return {
-      sourcesCount: sources.length,
+      sourcesCount: sources.length + libSources.length,
       exportsCount: exportsList.length,
       adsCount: ads.length,
       presetsCount: presets.length,
@@ -856,7 +981,7 @@ export async function clearAllVaultMediaStores(options?: {
   const clearedStores: string[] = [];
   const preservedStores: string[] = [];
   const errors: string[] = [];
-  const storeNames = [SOURCES_STORE, EXPORTS_STORE, ADS_STORE];
+  const storeNames = [SOURCES_STORE, LIBRARY_SOURCES_STORE, EXPORTS_STORE, ADS_STORE];
   if (!preserveAdPresets) {
     storeNames.push(AD_PRESETS_STORE);
   } else {

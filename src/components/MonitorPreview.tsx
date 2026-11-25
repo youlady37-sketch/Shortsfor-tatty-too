@@ -1,10 +1,13 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, Eye, EyeOff, Film, Layers, Play, Square, Volume2 } from 'lucide-react';
+import { resolveSegmentMediaAsset } from '../shared/sourceLibrary.ts';
 import type {
   AdAssetInfo,
   AdOverlayLayer,
   CutSegment,
   PreloadedOverlay,
+  SegmentAutoFrameResult,
+  SourceLibraryItem,
   SubtitleCue,
   UploadedAsset,
 } from '../types.ts';
@@ -12,6 +15,7 @@ import { computeAdOverlayBox, evaluateAdCollisions } from '../utils/adGeometry.t
 
 interface MonitorPreviewProps {
   segments: CutSegment[];
+  libraryItems: SourceLibraryItem[];
   activeSegment: CutSegment | null;
   uploadedAssets: Partial<Record<'fragment8' | 'fragment9' | 'music' | 'endplate' | 'audioLogo', UploadedAsset>>;
   preloaded: PreloadedOverlay[];
@@ -23,10 +27,35 @@ interface MonitorPreviewProps {
   audioLogoAssetId: string;
   totalDurationSec: number;
   mainDurationSec: number;
+  autoFrameResult?: SegmentAutoFrameResult | null;
+}
+
+function interpolateCropOffsetX(
+  keyframes: SegmentAutoFrameResult['keyframes'],
+  tSec: number,
+): number {
+  if (keyframes.length === 0) return 0;
+  if (keyframes.length === 1 || tSec <= keyframes[0].t) {
+    return keyframes[0].cropOffsetX;
+  }
+  const last = keyframes[keyframes.length - 1];
+  if (tSec >= last.t) return last.cropOffsetX;
+
+  for (let i = 0; i < keyframes.length - 1; i += 1) {
+    const a = keyframes[i];
+    const b = keyframes[i + 1];
+    if (tSec >= a.t && tSec <= b.t) {
+      if (b.shotCut || b.t - a.t <= 0.001) return a.cropOffsetX;
+      const alpha = (tSec - a.t) / (b.t - a.t);
+      return Math.round(a.cropOffsetX + (b.cropOffsetX - a.cropOffsetX) * alpha);
+    }
+  }
+  return last.cropOffsetX;
 }
 
 export const MonitorPreview: React.FC<MonitorPreviewProps> = ({
   segments,
+  libraryItems,
   activeSegment,
   uploadedAssets,
   preloaded,
@@ -38,6 +67,7 @@ export const MonitorPreview: React.FC<MonitorPreviewProps> = ({
   audioLogoAssetId,
   totalDurationSec,
   mainDurationSec,
+  autoFrameResult,
 }) => {
   const [showSafeZones, setShowSafeZones] = useState(true);
   const [showAllAdLayersInPreview, setShowAllAdLayersInPreview] = useState(true);
@@ -47,7 +77,9 @@ export const MonitorPreview: React.FC<MonitorPreviewProps> = ({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
-  const activeAsset = activeSegment ? uploadedAssets[activeSegment.sourceRole] : undefined;
+  const activeAsset = activeSegment
+    ? resolveSegmentMediaAsset(activeSegment, libraryItems, uploadedAssets)
+    : null;
   const activeOverlay = activeSegment?.overlayId
     ? preloaded.find((p) => p.id === activeSegment.overlayId)
     : undefined;
@@ -133,8 +165,15 @@ export const MonitorPreview: React.FC<MonitorPreviewProps> = ({
 
   const anyCollisionMessage = visibleAdLayers.flatMap((v) => v.collisions.messages)[0] ?? null;
 
+  const isAutoFraming = activeSegment ? activeSegment.framingMode !== 'manual' : true;
+  const effectiveCropOffsetX = activeSegment
+    ? isAutoFraming && autoFrameResult && autoFrameResult.keyframes.length > 0
+      ? interpolateCropOffsetX(autoFrameResult.keyframes, localTimeSec)
+      : activeSegment.cropOffsetX
+    : 0;
+
   const objectPositionX = activeSegment
-    ? `${Math.round(((activeSegment.cropOffsetX + 100) / 200) * 100)}%`
+    ? `${Math.round(((effectiveCropOffsetX + 100) / 200) * 100)}%`
     : '50%';
 
   const durationOk = totalDurationSec >= 55 && totalDurationSec <= 59;
@@ -235,13 +274,16 @@ export const MonitorPreview: React.FC<MonitorPreviewProps> = ({
           <div className="w-full h-full flex flex-col items-center justify-center p-6 text-center bg-[#0B0F17]">
             <Film className="w-8 h-8 text-slate-600 mb-3" />
             <p className="text-xs font-medium text-slate-300">
-              {activeSegment?.sourceRole === 'fragment8'
-                ? 'Ожидается «Фрагмент 8»'
-                : 'Ожидается «Фрагмент 9»'}
+              {activeSegment?.sourceId
+                ? 'Исходник не найден в библиотеке'
+                : activeSegment?.sourceRole === 'fragment8'
+                  ? 'Ожидается исходник («Фрагмент 8» или видео из библиотеки)'
+                  : activeSegment?.sourceRole === 'fragment9'
+                    ? 'Ожидается исходник («Фрагмент 9» или видео из библиотеки)'
+                    : 'Выберите исходник в библиотеке'}
             </p>
             <p className="text-[11px] text-slate-500 mt-1.5 leading-relaxed">
-              Загрузите оригинальный видеофайл во вкладке «Активы и звук», чтобы увидеть живой
-              кадр 9:16 и настроить кадрирование лиц.
+              Загрузите видеофайлы во вкладке «Активы и звук» и привяжите нужный фрагмент к сегменту, чтобы увидеть живой кадр 9:16.
             </p>
           </div>
         )}
@@ -338,7 +380,9 @@ export const MonitorPreview: React.FC<MonitorPreviewProps> = ({
         <div className="flex items-center justify-between text-slate-400">
           <span>Режим кадра</span>
           <span className="font-mono tabular-nums text-slate-200">
-            {activeSegment ? `X: ${activeSegment.cropOffsetX > 0 ? `+${activeSegment.cropOffsetX}` : activeSegment.cropOffsetX}%` : '—'}
+            {activeSegment
+              ? `${isAutoFraming ? 'Авто' : 'Ручн.'} X: ${effectiveCropOffsetX > 0 ? `+${effectiveCropOffsetX}` : effectiveCropOffsetX}%`
+              : '—'}
           </span>
         </div>
 

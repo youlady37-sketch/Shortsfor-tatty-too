@@ -1,11 +1,13 @@
 import React, { useState } from 'react';
 import { Download, Mic, Plus, Trash2 } from 'lucide-react';
-import type { CutSegment, SubtitleCue, UploadedAsset } from '../types.ts';
+import { resolveSegmentMediaAsset } from '../shared/sourceLibrary.ts';
+import type { CutSegment, SourceLibraryItem, SubtitleCue, UploadedAsset } from '../types.ts';
 
 interface SubtitleEditorProps {
   subtitles: SubtitleCue[];
   onChangeSubtitles: (next: SubtitleCue[]) => void;
   segments: CutSegment[];
+  libraryItems: SourceLibraryItem[];
   uploadedAssets: Partial<Record<'fragment8' | 'fragment9' | 'music' | 'endplate' | 'audioLogo', UploadedAsset>>;
 }
 
@@ -22,13 +24,16 @@ export const SubtitleEditor: React.FC<SubtitleEditorProps> = ({
   subtitles,
   onChangeSubtitles,
   segments,
+  libraryItems,
   uploadedAssets,
 }) => {
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [rawTranscript, setRawTranscript] = useState<string>('');
 
-  const canTranscribe = segments.every((s) => Boolean(uploadedAssets[s.sourceRole]));
+  const canTranscribe =
+    segments.length > 0 &&
+    segments.every((s) => Boolean(resolveSegmentMediaAsset(s, libraryItems, uploadedAssets)));
 
   const handleAutoTranscribe = async () => {
     setError(null);
@@ -122,7 +127,7 @@ export const SubtitleEditor: React.FC<SubtitleEditorProps> = ({
             title={
               canTranscribe
                 ? 'Дословно распознать речь из загруженных видеосегментов'
-                : 'Загрузите Фрагмент 8 и Фрагмент 9 для распознавания речи'
+                : 'Привяжите загруженные видео из библиотеки ко всем сегментам таймлайна'
             }
             className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium bg-[#121826] border border-[#242E42] text-slate-200 rounded hover:border-slate-500 disabled:opacity-40 transition-colors whitespace-nowrap"
           >

@@ -16,16 +16,23 @@ import {
 import {
   deleteAdPresetFromVault,
   getBrowserVaultDiagnostics,
+  getLibrarySourceFromVault,
   getSourceFromVault,
   listAdAssetsInVault,
   listAdAudioInVault,
   listAdPresetsInVault,
   listExportsInVault,
+  listLibrarySourcesInVault,
   listSourcesInVault,
   saveAdPresetToVault,
   syncAdPresetsVault,
 } from './utils/browserMediaVault.ts';
-import { uploadSourceFileToServer } from './utils/uploadSourceFile.ts';
+import {
+  uploadLibraryVideoToServer,
+  uploadSourceFileToServer,
+} from './utils/uploadSourceFile.ts';
+import { normalizeShortNumber } from './shared/exportNaming.ts';
+import { resolveSegmentMediaAsset, sortLibrarySources } from './shared/sourceLibrary.ts';
 import type {
   AdAssetInfo,
   AdAudioAssetInfo,
@@ -38,8 +45,11 @@ import type {
   ExportJobResult,
   ExportJobStatus,
   ExportVaultBackupState,
+  MissingLibrarySource,
   MissingUploadedAsset,
   PreloadedOverlay,
+  SegmentAutoFrameResult,
+  SourceLibraryItem,
   SourceRole,
   StorageEnvironmentInfo,
   SubtitleCue,
@@ -109,6 +119,12 @@ const INITIAL_SUBTITLES: SubtitleCue[] = [
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabKey>('timeline');
   const [preloaded, setPreloaded] = useState<PreloadedOverlay[]>([]);
+  const [libraryItems, setLibraryItems] = useState<SourceLibraryItem[]>([]);
+  const [missingLibraryItems, setMissingLibraryItems] = useState<MissingLibrarySource[]>([]);
+  const [restoringLibraryIds, setRestoringLibraryIds] = useState<Record<string, boolean>>({});
+  const [vaultLibrarySources, setVaultLibrarySources] = useState<
+    Record<string, { originalName: string; sizeBytes: number; savedAt: string }>
+  >({});
   const [uploadedAssets, setUploadedAssets] = useState<
     Partial<Record<SourceRole, UploadedAsset>>
   >({});
@@ -134,6 +150,7 @@ export default function App() {
   );
   const [subtitles, setSubtitles] = useState<SubtitleCue[]>(INITIAL_SUBTITLES);
 
+  const [shortNumber, setShortNumber] = useState<number>(24);
   const [endplateAssetId, setEndplateAssetId] = useState<string>('preloaded:shorts-04');
   const [endplateDurationSec, setEndplateDurationSec] = useState<number>(2.0);
   const [audioLogoAssetId, setAudioLogoAssetId] = useState<string>('preloaded:audio-logo');
@@ -155,18 +172,23 @@ export default function App() {
   const [adPresets, setAdPresets] = useState<AdPreset[]>([]);
   const [selectedAdLayerId, setSelectedAdLayerId] = useState<string | null>(null);
   const [isCleanupModalOpen, setIsCleanupModalOpen] = useState(false);
+  const [autoFrameBySegmentId, setAutoFrameBySegmentId] = useState<
+    Record<string, SegmentAutoFrameResult>
+  >({});
   const pollTimerRef = useRef<number | null>(null);
 
   const refreshVaultLists = async () => {
-    const [sources, exportsMap, diag] = await Promise.all([
+    const [sources, libSources, exportsMap, diag] = await Promise.all([
       listSourcesInVault(),
+      listLibrarySourcesInVault(),
       listExportsInVault(),
       getBrowserVaultDiagnostics(),
     ]);
     setVaultSources(sources);
+    setVaultLibrarySources(libSources);
     setVaultExports(exportsMap);
     setVaultDiagnostics(diag);
-    return { sources, exportsMap, diag };
+    return { sources, libSources, exportsMap, diag };
   };
 
   const refreshExportHistory = async () => {
@@ -227,6 +249,33 @@ export default function App() {
     return false;
   };
 
+  const restoreLibraryItemFromVault = async (id: string) => {
+    const cached = await getLibrarySourceFromVault(id);
+    if (!cached) return;
+
+    setRestoringLibraryIds((prev) => ({ ...prev, [id]: true }));
+    try {
+      const file = new File([cached.blob], cached.originalName, {
+        type: cached.mimeType || 'video/mp4',
+      });
+      const restored = await uploadLibraryVideoToServer({ file });
+      handleLibraryItemsAdded([restored]);
+      setMissingLibraryItems((prev) => prev.filter((m) => m.id !== id));
+    } catch (err) {
+      setVaultWarning(
+        err instanceof Error
+          ? err.message
+          : `Ошибка при восстановлении «${cached.originalName}» из IndexedDB.`,
+      );
+    } finally {
+      setRestoringLibraryIds((prev) => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+    }
+  };
+
   useEffect(() => {
     let cancelled = false;
 
@@ -242,6 +291,13 @@ export default function App() {
         }
         const serverUploaded = (data.uploaded ?? {}) as Partial<Record<SourceRole, UploadedAsset>>;
         setUploadedAssets(serverUploaded);
+
+        if (Array.isArray(data.library)) {
+          setLibraryItems(sortLibrarySources(data.library as SourceLibraryItem[], 'segment'));
+        }
+        if (Array.isArray(data.missingLibrary)) {
+          setMissingLibraryItems(data.missingLibrary as MissingLibrarySource[]);
+        }
 
         if (data.missingUploaded) {
           setMissingAssets(data.missingUploaded);
@@ -380,6 +436,62 @@ export default function App() {
     return () => window.clearInterval(id);
   }, [isExporting, exportJob?.startedAt]);
 
+  const autoFrameQuerySignature = useMemo(() => {
+    return segments
+      .filter((s) => s.framingMode !== 'manual')
+      .map((s) => {
+        const asset = resolveSegmentMediaAsset(s, libraryItems, uploadedAssets);
+        if (!asset) return null;
+        return `${s.id}:${asset.key}:${s.startSec}:${s.endSec}`;
+      })
+      .filter(Boolean)
+      .join('|');
+  }, [segments, libraryItems, uploadedAssets]);
+
+  useEffect(() => {
+    const targetSegments = segments.filter(
+      (s) =>
+        s.framingMode !== 'manual' &&
+        Boolean(resolveSegmentMediaAsset(s, libraryItems, uploadedAssets)),
+    );
+    if (targetSegments.length === 0) {
+      return;
+    }
+
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      try {
+        const res = await fetch('/api/auto-frame', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            segments: targetSegments.map((s) => ({
+              id: s.id,
+              sourceId: s.sourceId,
+              sourceRole: s.sourceRole,
+              startSec: s.startSec,
+              endSec: s.endSec,
+            })),
+          }),
+        });
+        if (!res.ok || cancelled) return;
+        const data = (await res.json()) as {
+          results?: Record<string, SegmentAutoFrameResult>;
+        };
+        if (!cancelled && data.results) {
+          setAutoFrameBySegmentId((prev) => ({ ...prev, ...data.results }));
+        }
+      } catch {
+        // non-blocking preview enhancement; export still computes auto-framing directly
+      }
+    }, 350);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [autoFrameQuerySignature]);
+
   const mainDurationSec = useMemo(
     () =>
       segments.reduce((acc, seg) => acc + Math.max(0, seg.endSec - seg.startSec), 0),
@@ -390,7 +502,37 @@ export default function App() {
   const activeSegment =
     segments.find((s) => s.id === selectedSegmentId) ?? segments[0] ?? null;
 
-  const hasBothSources = Boolean(uploadedAssets.fragment8 && uploadedAssets.fragment9);
+  const allSourcesReady = useMemo(
+    () =>
+      segments.length > 0 &&
+      segments.every((s) => Boolean(resolveSegmentMediaAsset(s, libraryItems, uploadedAssets))),
+    [segments, libraryItems, uploadedAssets],
+  );
+
+  const handleLibraryItemsAdded = (added: SourceLibraryItem[]) => {
+    setLibraryItems((prev) => {
+      const map = new Map<string, SourceLibraryItem>();
+      for (const item of prev) map.set(item.id, item);
+      for (const item of added) map.set(item.id, item);
+      return sortLibrarySources(Array.from(map.values()), 'segment');
+    });
+    const addedIds = new Set(added.map((a) => a.id));
+    setMissingLibraryItems((prev) => prev.filter((m) => !addedIds.has(m.id)));
+  };
+
+  const handleLibraryItemUpdated = (updated: SourceLibraryItem) => {
+    setLibraryItems((prev) =>
+      sortLibrarySources(
+        prev.map((item) => (item.id === updated.id ? updated : item)),
+        'segment',
+      ),
+    );
+  };
+
+  const handleLibraryItemRemoved = (id: string) => {
+    setLibraryItems((prev) => prev.filter((item) => item.id !== id));
+    setMissingLibraryItems((prev) => prev.filter((m) => m.id !== id));
+  };
 
   const handleAssetsSynced = (assigned: Partial<Record<SourceRole, UploadedAsset>>) => {
     setUploadedAssets((prev) => ({ ...prev, ...assigned }));
@@ -525,11 +667,13 @@ export default function App() {
 
   const handleAddSegment = () => {
     const id = `seg-${Date.now()}`;
+    const defaultSourceId = libraryItems[0]?.id;
     setSegments((prev) => [
       ...prev,
       {
         id,
-        sourceRole: 'fragment9',
+        sourceId: defaultSourceId,
+        sourceRole: defaultSourceId ? undefined : 'fragment9',
         beatTitle: 'Новый монтажный фрагмент',
         startSec: 0,
         endSec: 5,
@@ -647,6 +791,7 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          shortNumber: normalizeShortNumber(shortNumber, 1),
           segments,
           subtitles,
           endplateAssetId,
@@ -765,6 +910,9 @@ export default function App() {
   };
 
   const handleCleanupExecuted = (preserveAdPresets: boolean) => {
+    setLibraryItems([]);
+    setMissingLibraryItems([]);
+    setRestoringLibraryIds({});
     setUploadedAssets({});
     setMissingAssets({});
     setRestoringRoles({});
@@ -834,11 +982,11 @@ export default function App() {
             <button
               type="button"
               onClick={handleExport}
-              disabled={!hasBothSources || isExporting}
+              disabled={!allSourcesReady || isExporting}
               title={
-                hasBothSources
+                allSourcesReady
                   ? 'Собрать готовые MP4 (Версия А и Версия Б)'
-                  : 'Загрузите Фрагмент 8 и Фрагмент 9 во вкладке «Активы и звук»'
+                  : 'Загрузите видео в «Библиотеку исходников» и выберите исходник для каждого сегмента'
               }
               className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium bg-[#DC2626] text-white rounded hover:bg-[#B91C1C] disabled:opacity-45 disabled:cursor-not-allowed transition-colors whitespace-nowrap shrink-0"
             >
@@ -853,20 +1001,20 @@ export default function App() {
 
       <main className="flex-1 max-w-[1440px] w-full mx-auto px-6 py-6 space-y-6">
         {/* Missing Video Sources Banner */}
-        {!hasBothSources && (
+        {!allSourcesReady && (
           <div className="bg-[#121826] border border-amber-800/60 rounded-lg p-4 flex flex-wrap items-center justify-between gap-4">
             <div className="flex items-start gap-3">
               <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
               <div className="text-xs leading-relaxed">
                 <div className="font-semibold text-amber-200 text-sm">
-                  Для сборки готовых MP4 не хватает исходных видеофайлов «Следствие вели…»
+                  {libraryItems.length === 0
+                    ? 'Загрузите исходные видеофайлы в библиотеку'
+                    : 'Для части сегментов на таймлайне не выбран видеофайл из библиотеки'}
                 </div>
                 <p className="text-slate-300 mt-1">
-                  К проекту приложены фирменные шаблоны, маркеры рубрик, логотипы и звуковой логотип WAV ({preloaded.length || 22} шт.), но отсутствуют видео{' '}
-                  <span className="font-mono text-slate-100">Фрагмент 8</span> (00:04:10–00:04:26) и{' '}
-                  <span className="font-mono text-slate-100">Фрагмент 9</span> (00:00:00–00:01:15).
-                  Имитация или генерация кадров запрещена. Загрузите оригинальные видеофайлы, чтобы
-                  разблокировать экспорт Версии А и Версии Б.
+                  {libraryItems.length === 0
+                    ? `К проекту приложены фирменные шаблоны, маркеры рубрик, логотипы и звуковой логотип WAV (${preloaded.length || 22} шт.). Загрузите MP4-части серии во вкладке «Активы и звук» и назначьте их сегментам таймлайна, чтобы разблокировать экспорт Версии А и Версии Б.`
+                    : `В библиотеке загружено файлов: ${libraryItems.length}. Выберите нужный видеофайл для каждого сегмента на вкладке «Монтаж», чтобы разблокировать экспорт Версии А и Версии Б.`}
                 </p>
               </div>
             </div>
@@ -877,7 +1025,7 @@ export default function App() {
               className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium bg-[#0B0F17] border border-[#242E42] text-slate-100 rounded hover:border-slate-500 transition-colors whitespace-nowrap shrink-0"
             >
               <Film className="w-3.5 h-3.5" />
-              Загрузить исходники
+              Открыть библиотеку
             </button>
           </div>
         )}
@@ -1013,10 +1161,14 @@ export default function App() {
                       label: 'Скачать Версию А',
                       report: exportJob.result.versionA,
                     },
-                    {
-                      label: 'Скачать Версию Б',
-                      report: exportJob.result.versionB,
-                    },
+                    ...(exportJob.result.versionB
+                      ? [
+                          {
+                            label: 'Скачать Версию Б',
+                            report: exportJob.result.versionB,
+                          },
+                        ]
+                      : []),
                   ].map(({ label, report }) => {
                     const isDownloadingThis =
                       downloadProgress?.jobId === exportJob.result?.jobId &&
@@ -1075,6 +1227,7 @@ export default function App() {
             {activeTab === 'timeline' && (
               <TimelineEditor
                 segments={segments}
+                libraryItems={libraryItems}
                 selectedSegmentId={selectedSegmentId}
                 onSelectSegment={setSelectedSegmentId}
                 onUpdateSegment={handleUpdateSegment}
@@ -1097,6 +1250,8 @@ export default function App() {
                 }}
                 uploadedAssets={uploadedAssets}
                 preloaded={preloaded}
+                shortNumber={shortNumber}
+                onChangeShortNumber={(val) => setShortNumber(normalizeShortNumber(val, 1))}
                 endplateAssetId={endplateAssetId}
                 onChangeEndplateAssetId={setEndplateAssetId}
                 endplateDurationSec={endplateDurationSec}
@@ -1107,6 +1262,7 @@ export default function App() {
                 onChangeUseUploadedMusic={setUseUploadedMusic}
                 musicGainDb={musicGainDb}
                 onChangeMusicGainDb={setMusicGainDb}
+                autoFrameBySegmentId={autoFrameBySegmentId}
               />
             )}
 
@@ -1115,6 +1271,7 @@ export default function App() {
                 subtitles={subtitles}
                 onChangeSubtitles={setSubtitles}
                 segments={segments}
+                libraryItems={libraryItems}
                 uploadedAssets={uploadedAssets}
               />
             )}
@@ -1143,6 +1300,10 @@ export default function App() {
 
             {activeTab === 'assets' && (
               <AssetsPanel
+                libraryItems={libraryItems}
+                missingLibraryItems={missingLibraryItems}
+                restoringLibraryIds={restoringLibraryIds}
+                vaultLibrarySources={vaultLibrarySources}
                 uploadedAssets={uploadedAssets}
                 missingAssets={missingAssets}
                 restoringRoles={restoringRoles}
@@ -1153,6 +1314,12 @@ export default function App() {
                 preloaded={preloaded}
                 selectedSegmentId={activeSegment?.id ?? null}
                 selectedSegmentTitle={activeSegment?.beatTitle ?? null}
+                onLibraryItemsAdded={handleLibraryItemsAdded}
+                onLibraryItemUpdated={handleLibraryItemUpdated}
+                onLibraryItemRemoved={handleLibraryItemRemoved}
+                onRestoreLibraryItemFromVault={(id) => {
+                  void restoreLibraryItemFromVault(id).then(() => refreshVaultLists());
+                }}
                 onAssetUploaded={handleAssetUploaded}
                 onAssetsSynced={handleAssetsSynced}
                 onAssetRemoved={handleAssetRemoved}
@@ -1180,6 +1347,7 @@ export default function App() {
             {activeTab === 'qc' && (
               <QualityChecklist
                 segments={segments}
+                libraryItems={libraryItems}
                 subtitles={subtitles}
                 adLayers={adLayers}
                 uploadedAssets={uploadedAssets}
@@ -1209,6 +1377,7 @@ export default function App() {
           <div className="lg:col-span-4 lg:sticky lg:top-22">
             <MonitorPreview
               segments={segments}
+              libraryItems={libraryItems}
               activeSegment={activeSegment}
               uploadedAssets={uploadedAssets}
               preloaded={preloaded}
@@ -1220,6 +1389,9 @@ export default function App() {
               audioLogoAssetId={audioLogoAssetId}
               totalDurationSec={totalDurationSec}
               mainDurationSec={mainDurationSec}
+              autoFrameResult={
+                activeSegment ? autoFrameBySegmentId[activeSegment.id] ?? null : null
+              }
             />
           </div>
         </div>

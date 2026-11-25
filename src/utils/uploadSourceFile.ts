@@ -1,4 +1,9 @@
-import type { SourceRole, UploadedAsset } from '../types.ts';
+import type {
+  SourceLibraryItem,
+  SourceRole,
+  SourceVideoMetadata,
+  UploadedAsset,
+} from '../types.ts';
 
 const CHUNK_SIZE_BYTES = 4 * 1024 * 1024; // 4 MiB — safely below Cloud Run 32 MiB request limit
 
@@ -45,6 +50,96 @@ async function parseJsonResponseSafe<T>(res: Response): Promise<T> {
   }
 
   return parsed as T;
+}
+
+export async function uploadLibraryVideoToServer(params: {
+  file: File;
+  onProgress?: (percent: number) => void;
+}): Promise<SourceLibraryItem> {
+  const { file, onProgress } = params;
+
+  if (file.size <= CHUNK_SIZE_BYTES) {
+    onProgress?.(10);
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const res = await fetch('/api/library/upload', {
+      method: 'POST',
+      credentials: 'include',
+      body: formData,
+    });
+    const data = await parseJsonResponseSafe<{ item: SourceLibraryItem }>(res);
+    onProgress?.(100);
+    return data.item;
+  }
+
+  const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE_BYTES));
+  onProgress?.(2);
+
+  const initRes = await fetch('/api/library/upload/init', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      originalName: file.name,
+      mimeType: file.type || 'video/mp4',
+      totalSizeBytes: file.size,
+      totalChunks,
+    }),
+  });
+  const { uploadId } = await parseJsonResponseSafe<{ uploadId: string }>(initRes);
+
+  for (let i = 0; i < totalChunks; i += 1) {
+    const start = i * CHUNK_SIZE_BYTES;
+    const end = Math.min(file.size, start + CHUNK_SIZE_BYTES);
+    const chunkBlob = file.slice(start, end);
+
+    const chunkRes = await fetch(
+      `/api/library/upload/chunk/${encodeURIComponent(uploadId)}/${i}`,
+      {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: chunkBlob,
+      },
+    );
+    await parseJsonResponseSafe<{ ok: boolean }>(chunkRes);
+    const pct = Math.min(95, Math.round(((i + 1) / totalChunks) * 92) + 3);
+    onProgress?.(pct);
+  }
+
+  const completeRes = await fetch('/api/library/upload/complete', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ uploadId }),
+  });
+
+  const completeData = await parseJsonResponseSafe<{ item: SourceLibraryItem }>(completeRes);
+  onProgress?.(100);
+  return completeData.item;
+}
+
+export async function updateLibraryVideoMetadata(
+  id: string,
+  patch: Partial<SourceVideoMetadata>,
+): Promise<SourceLibraryItem> {
+  const res = await fetch(`/api/library/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+  const data = await parseJsonResponseSafe<{ item: SourceLibraryItem }>(res);
+  return data.item;
+}
+
+export async function deleteLibraryVideoFromServer(id: string): Promise<void> {
+  const res = await fetch(`/api/library/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    credentials: 'include',
+  });
+  await parseJsonResponseSafe<{ ok: boolean }>(res);
 }
 
 export async function uploadSourceFileToServer(params: {

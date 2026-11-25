@@ -171,7 +171,7 @@ export function buildServerCleanupPlan(params: {
   }
 
   // 5. Temporary release state JSON files in storage/ (never includes persistent presets when preserveAdPresets=true)
-  for (const jsonName of ['uploaded_state.json', 'ad_state.json']) {
+  for (const jsonName of ['uploaded_state.json', 'library_state.json', 'ad_state.json']) {
     const absPath = path.join(storageDir, jsonName);
     if (fs.existsSync(absPath)) {
       const sizeBytes = getFileSizeSafe(absPath);

@@ -271,33 +271,36 @@ export async function downloadBothExportVersions(params: {
   const { result, onProgress } = params;
   const warnings: string[] = [];
 
+  const hasB = Boolean(result.versionB);
   const resA = await downloadExportFile({
     url: result.versionA.url,
     jobId: result.jobId,
     version: 'A',
     fileName: result.versionA.fileName,
     expectedSizeBytes: result.versionA.probe.sizeBytes,
-    batchStep: { current: 1, total: 2 },
+    batchStep: hasB ? { current: 1, total: 2 } : undefined,
     onProgress,
   });
   if (resA.vaultSaveResult && !resA.vaultSaveResult.ok && resA.vaultSaveResult.error) {
     warnings.push(resA.vaultSaveResult.error);
   }
 
-  // Sequential pause so browser does not block the second download prompt
-  await sleep(450);
+  if (result.versionB) {
+    // Sequential pause so browser does not block the second download prompt
+    await sleep(450);
 
-  const resB = await downloadExportFile({
-    url: result.versionB.url,
-    jobId: result.jobId,
-    version: 'B',
-    fileName: result.versionB.fileName,
-    expectedSizeBytes: result.versionB.probe.sizeBytes,
-    batchStep: { current: 2, total: 2 },
-    onProgress,
-  });
-  if (resB.vaultSaveResult && !resB.vaultSaveResult.ok && resB.vaultSaveResult.error) {
-    warnings.push(resB.vaultSaveResult.error);
+    const resB = await downloadExportFile({
+      url: result.versionB.url,
+      jobId: result.jobId,
+      version: 'B',
+      fileName: result.versionB.fileName,
+      expectedSizeBytes: result.versionB.probe.sizeBytes,
+      batchStep: { current: 2, total: 2 },
+      onProgress,
+    });
+    if (resB.vaultSaveResult && !resB.vaultSaveResult.ok && resB.vaultSaveResult.error) {
+      warnings.push(resB.vaultSaveResult.error);
+    }
   }
 
   return { vaultWarning: warnings.length > 0 ? warnings.join(' ') : null };
@@ -311,7 +314,7 @@ export async function backupExportResultToVault(
     jobId: result.jobId,
     status: 'backing-up',
     versionA: 'pending',
-    versionB: 'pending',
+    versionB: result.versionB ? 'pending' : 'saved',
   };
   setVaultBackupProgress(`Резервирование готового выпуска ${result.jobId} в IndexedDB…`);
   onStateChange?.({ ...state });
@@ -343,28 +346,30 @@ export async function backupExportResultToVault(
   }
   onStateChange?.({ ...state, error: errors.join(' ') || undefined });
 
-  // Version B
-  try {
-    const resB = await fetchExportBlobVerified({
-      url: result.versionB.url,
-      jobId: result.jobId,
-      version: 'B',
-      fileName: result.versionB.fileName,
-      expectedSizeBytes: result.versionB.probe.sizeBytes,
-    });
-    if (resB.vaultSaveResult?.ok) {
-      state.versionB = 'saved';
-    } else {
+  // Version B (only if present)
+  if (result.versionB) {
+    try {
+      const resB = await fetchExportBlobVerified({
+        url: result.versionB.url,
+        jobId: result.jobId,
+        version: 'B',
+        fileName: result.versionB.fileName,
+        expectedSizeBytes: result.versionB.probe.sizeBytes,
+      });
+      if (resB.vaultSaveResult?.ok) {
+        state.versionB = 'saved';
+      } else {
+        state.versionB = 'error';
+        errors.push(
+          resB.vaultSaveResult?.error || 'Не удалось завершить запись Версии Б в IndexedDB.',
+        );
+      }
+    } catch (err) {
       state.versionB = 'error';
       errors.push(
-        resB.vaultSaveResult?.error || 'Не удалось завершить запись Версии Б в IndexedDB.',
+        `Версия Б: ${err instanceof Error ? err.message : 'ошибка фонового сохранения.'}`,
       );
     }
-  } catch (err) {
-    state.versionB = 'error';
-    errors.push(
-      `Версия Б: ${err instanceof Error ? err.message : 'ошибка фонового сохранения.'}`,
-    );
   }
 
   if (state.versionA === 'saved' && state.versionB === 'saved') {

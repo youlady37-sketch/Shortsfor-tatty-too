@@ -23,6 +23,44 @@ export interface UploadedAsset {
   warnings: string[];
 }
 
+export interface SourceVideoMetadata {
+  program: string;
+  season: number | null;
+  episode: number | null;
+  originalStartTime: string | null;
+  originalEndTime: string | null;
+  originalStartSec: number | null;
+  originalEndSec: number | null;
+  segmentNumber: number | null;
+  isAutoParsed: boolean;
+}
+
+export interface SourceLibraryItem {
+  id: string;
+  fileName: string;
+  originalName: string;
+  url: string;
+  filePath: string;
+  mimeType?: string;
+  probe: MediaProbeInfo;
+  warnings: string[];
+  uploadedAt: string;
+  legacyRole?: 'fragment8' | 'fragment9';
+  metadata: SourceVideoMetadata;
+}
+
+export interface MissingLibrarySource {
+  id: string;
+  originalName: string;
+  fileName: string;
+  sizeBytes: number;
+  probe: MediaProbeInfo;
+  uploadedAt: string;
+  legacyRole?: 'fragment8' | 'fragment9';
+  metadata: SourceVideoMetadata;
+  reason: string;
+}
+
 export type PreloadedCategory =
   | 'endplate'
   | 'title-card'
@@ -54,13 +92,36 @@ export interface PreloadedOverlay {
   note: string;
 }
 
+export type FramingMode = 'auto' | 'manual';
+
+export interface AutoFrameKeyframe {
+  t: number;
+  centerXNorm: number;
+  centerYNorm: number;
+  cropOffsetX: number;
+  faceCount: number;
+  shotCut?: boolean;
+}
+
+export interface SegmentAutoFrameResult {
+  segmentId?: string;
+  strategy: 'face-track' | 'multi-face' | 'foreground-fallback' | 'center-fallback';
+  facesDetectedFrames: number;
+  totalSampledFrames: number;
+  maxFacesInFrame: number;
+  recommendedCropOffsetX: number;
+  keyframes: AutoFrameKeyframe[];
+}
+
 export interface CutSegment {
   id: string;
-  sourceRole: 'fragment8' | 'fragment9';
+  sourceId?: string;
+  sourceRole?: 'fragment8' | 'fragment9';
   beatTitle: string;
   startSec: number;
   endSec: number;
   cropOffsetX: number; // -100 (left) to 100 (right)
+  framingMode?: FramingMode; // default/undefined = 'auto' (face + upper body tracking)
   overlayId: string | null;
 }
 
@@ -191,6 +252,7 @@ export interface AdPreset {
 }
 
 export interface ExportRequestPayload {
+  shortNumber?: number;
   segments: CutSegment[];
   subtitles: SubtitleCue[];
   endplateAssetId: string; // 'preloaded:shorts-04' or 'uploaded:endplate'
@@ -198,6 +260,7 @@ export interface ExportRequestPayload {
   audioLogoAssetId: string; // 'preloaded:audio-logo' or 'uploaded:audioLogo'
   musicGainDb: number; // e.g. -22
   useUploadedMusic: boolean;
+  includeVersionB?: boolean;
   adLayers?: AdOverlayLayer[];
 }
 
@@ -211,16 +274,18 @@ export interface ExportedFileReport {
 
 export interface ExportJobResult {
   jobId: string;
+  shortNumber?: number;
   createdAt: string;
   mainDurationSec: number;
   endplateDurationSec: number;
   totalDurationSec: number;
   versionA: ExportedFileReport;
-  versionB: ExportedFileReport;
+  versionB?: ExportedFileReport;
 }
 
 export interface ExportJobStatus {
   jobId: string;
+  shortNumber?: number;
   status: 'running' | 'completed' | 'failed';
   stageIndex: number;
   totalStages: number;

@@ -10,6 +10,7 @@ import {
   probeMedia,
   renderDualShortsExport,
 } from './src/server/ffmpegPipeline.ts';
+import { analyzeSegmentAutoFraming } from './src/server/autoFraming.ts';
 import { generateCoverArtwork, transcribeAudioToSubtitles } from './src/server/geminiService.ts';
 import {
   checkCloudObjectExists,
@@ -29,6 +30,17 @@ import {
   buildServerCleanupPlan,
   executeServerCleanup,
 } from './src/server/workspaceCleanup.ts';
+import {
+  parseSourceFilenameMetadata,
+  reconcileSourceMetadata,
+  resolveSegmentMediaAsset,
+  sortLibrarySources,
+} from './src/shared/sourceLibrary.ts';
+import {
+  buildShortExportFileNames,
+  normalizeShortNumber,
+  resolveExportDownloadFileName,
+} from './src/shared/exportNaming.ts';
 import type {
   AdOverlayLayer,
   AdPreset,
@@ -38,10 +50,13 @@ import type {
   ExportJobStatus,
   ExportRequestPayload,
   ImageSizeOption,
+  MissingLibrarySource,
   MissingUploadedAsset,
   OverlayPlacementMode,
   PreloadedCategory,
   PreloadedOverlay,
+  SegmentAutoFrameResult,
+  SourceLibraryItem,
   SourceRole,
   UploadedAsset,
 } from './src/types.ts';
@@ -58,6 +73,7 @@ const TEMP_DIR = path.join(STORAGE_DIR, 'temp');
 const AISTUDIO_ASSETS_DIR = path.join(__dirname, 'public', 'assets', 'aistudio');
 
 const UPLOADED_STATE_PATH = path.join(STORAGE_DIR, 'uploaded_state.json');
+const LIBRARY_STATE_PATH = path.join(STORAGE_DIR, 'library_state.json');
 
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 fs.mkdirSync(EXPORTS_DIR, { recursive: true });
@@ -65,8 +81,50 @@ fs.mkdirSync(TEMP_DIR, { recursive: true });
 
 const uploadedAssets: Partial<Record<SourceRole, UploadedAsset>> = {};
 const savedAssetRecords: Partial<Record<SourceRole, UploadedAsset>> = {};
+const activeLibraryItems = new Map<string, SourceLibraryItem>();
+const savedLibraryRecords = new Map<string, SourceLibraryItem>();
 const exportJobs = new Map<string, ExportJobStatus>();
 const adManager = new AdStorageManager(STORAGE_DIR);
+
+const ALLOWED_VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.mkv', '.avi', '.webm', '.m4v']);
+
+function isValidLibraryId(id: string): boolean {
+  return /^src_[a-zA-Z0-9_-]{3,80}$/.test(id);
+}
+
+function isAllowedVideoUpload(originalName: string, mimeType: string): boolean {
+  const ext = path.extname(originalName).toLowerCase();
+  if (ALLOWED_VIDEO_EXTENSIONS.has(ext)) return true;
+  if (!ext && mimeType.toLowerCase().startsWith('video/')) return true;
+  return false;
+}
+
+function sanitizeVideoExtension(originalName: string): string {
+  const ext = path.extname(originalName).toLowerCase().replace(/[^a-z0-9.]/g, '');
+  return ALLOWED_VIDEO_EXTENSIONS.has(ext) ? ext : '.mp4';
+}
+
+function isInsideUploadsDir(targetPath: string): boolean {
+  const resolvedUploads = path.resolve(UPLOADS_DIR);
+  const resolvedTarget = path.resolve(targetPath);
+  return resolvedTarget.startsWith(resolvedUploads + path.sep);
+}
+
+function normalizeMulterOriginalName(rawName: string): string {
+  const safe = rawName || 'video.mp4';
+  const hasHighByteOnly = /^[\u0000-\u00ff]+$/.test(safe) && /[\u0080-\u00ff]/.test(safe);
+  if (hasHighByteOnly) {
+    try {
+      const decoded = Buffer.from(safe, 'latin1').toString('utf8');
+      if (decoded && !decoded.includes('\uFFFD') && decoded !== safe) {
+        return path.basename(decoded);
+      }
+    } catch {
+      // keep raw
+    }
+  }
+  return path.basename(safe);
+}
 
 function isValidNonEmptyFile(filePath: string | undefined): { exists: boolean; sizeBytes: number } {
   if (!filePath) return { exists: false, sizeBytes: 0 };
@@ -104,6 +162,77 @@ function saveUploadedState() {
     fs.writeFileSync(UPLOADED_STATE_PATH, JSON.stringify(savedAssetRecords, null, 2), 'utf-8');
   } catch {
     // ignore write failures
+  }
+}
+
+function saveLibraryState() {
+  try {
+    const items = Array.from(savedLibraryRecords.values());
+    fs.writeFileSync(LIBRARY_STATE_PATH, JSON.stringify(items, null, 2), 'utf-8');
+  } catch {
+    // ignore write failures
+  }
+}
+
+function loadLibraryState() {
+  let loadedFromDisk = false;
+  if (fs.existsSync(LIBRARY_STATE_PATH)) {
+    try {
+      const raw = JSON.parse(fs.readFileSync(LIBRARY_STATE_PATH, 'utf-8')) as unknown;
+      const items = Array.isArray(raw) ? (raw as SourceLibraryItem[]) : [];
+      for (const item of items) {
+        if (!item?.id || !isValidLibraryId(item.id)) continue;
+        const normalized: SourceLibraryItem = {
+          ...item,
+          metadata: item.metadata ?? parseSourceFilenameMetadata(item.originalName || item.fileName),
+          warnings: Array.isArray(item.warnings) ? item.warnings : [],
+          uploadedAt: item.uploadedAt || new Date().toISOString(),
+        };
+        savedLibraryRecords.set(normalized.id, normalized);
+        if (isValidNonEmptyFile(normalized.filePath).exists) {
+          activeLibraryItems.set(normalized.id, normalized);
+        }
+      }
+      loadedFromDisk = true;
+    } catch {
+      // ignore corrupt library state
+    }
+  }
+
+  // Migrate any legacy fragment8/fragment9 records that are on disk & not yet tracked in library_state.json
+  let migrated = false;
+  for (const legacyRole of ['fragment8', 'fragment9'] as const) {
+    const legacy = savedAssetRecords[legacyRole];
+    if (!legacy || !isValidNonEmptyFile(legacy.filePath).exists) continue;
+    const alreadyInLibrary = Array.from(savedLibraryRecords.values()).some(
+      (item) =>
+        item.legacyRole === legacyRole ||
+        (item.filePath && path.resolve(item.filePath) === path.resolve(legacy.filePath)),
+    );
+    if (!alreadyInLibrary) {
+      const id = `src_legacy_${legacyRole}`;
+      const item: SourceLibraryItem = {
+        id,
+        fileName: legacy.fileName,
+        originalName: legacy.originalName,
+        url: legacy.url,
+        filePath: legacy.filePath,
+        probe: legacy.probe,
+        warnings: legacy.warnings ?? [],
+        uploadedAt: new Date().toISOString(),
+        legacyRole,
+        metadata: parseSourceFilenameMetadata(legacy.originalName),
+      };
+      savedLibraryRecords.set(id, item);
+      activeLibraryItems.set(id, item);
+      migrated = true;
+    }
+  }
+
+  if (migrated && !loadedFromDisk) {
+    saveLibraryState();
+  } else if (migrated) {
+    saveLibraryState();
   }
 }
 
@@ -146,7 +275,51 @@ async function syncUploadedAssetsAvailability(): Promise<{
   return { available, missing };
 }
 
+async function syncLibraryAvailability(): Promise<{
+  items: SourceLibraryItem[];
+  missingItems: MissingLibrarySource[];
+}> {
+  const availableList: SourceLibraryItem[] = [];
+  const missingList: MissingLibrarySource[] = [];
+
+  for (const [id, record] of savedLibraryRecords.entries()) {
+    let check = isValidNonEmptyFile(record.filePath);
+
+    if (!check.exists && record.fileName && record.filePath) {
+      const restored = await restoreFileFromCloud(`uploads/${record.fileName}`, record.filePath);
+      if (restored) {
+        check = isValidNonEmptyFile(record.filePath);
+      }
+    }
+
+    if (check.exists) {
+      activeLibraryItems.set(id, record);
+      availableList.push(record);
+    } else {
+      activeLibraryItems.delete(id);
+      missingList.push({
+        id: record.id,
+        originalName: record.originalName,
+        fileName: record.fileName,
+        sizeBytes: record.probe?.sizeBytes ?? 0,
+        probe: record.probe,
+        uploadedAt: record.uploadedAt,
+        legacyRole: record.legacyRole,
+        metadata: record.metadata,
+        reason:
+          'Исходный файл отсутствует на диске контейнера. Загрузите файл заново или восстановите его из IndexedDB.',
+      });
+    }
+  }
+
+  return {
+    items: sortLibrarySources(availableList, 'segment'),
+    missingItems: missingList,
+  };
+}
+
 loadUploadedState();
+loadLibraryState();
 
 const PRELOADED_DEFINITIONS: Array<{
   id: string;
@@ -415,9 +588,17 @@ async function getPreloadedAssets(): Promise<PreloadedOverlay[]> {
 }
 
 const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
+  destination: (_req, _file, cb) => {
+    try {
+      fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+    } catch {
+      // ignore
+    }
+    cb(null, UPLOADS_DIR);
+  },
   filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname) || '.bin';
+    const rawExt = path.extname(normalizeMulterOriginalName(file.originalname)).toLowerCase().replace(/[^a-z0-9.]/g, '');
+    const ext = rawExt || '.bin';
     const safeName = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`;
     cb(null, safeName);
   },
@@ -565,21 +746,27 @@ async function getLatestCompletedExport() {
         if (restoredB) bFile = isValidNonEmptyFile(bPath);
       }
 
-      // Never treat status.json as proof that MP4 exists — both MP4 files must physically exist
-      if (!aFile.exists || !bFile.exists) {
-        continue;
-      }
-
       const status = readJobStatus(jobId);
       if (status?.status === 'completed' && status.result) {
-        return status.result;
+        const needsB = Boolean(status.result.versionB);
+        if (aFile.exists && (!needsB || bFile.exists)) {
+          return status.result;
+        }
+      }
+
+      // Never treat status.json as proof that MP4 exists — required MP4 file(s) must physically exist
+      if (!aFile.exists || !bFile.exists) {
+        continue;
       }
 
       try {
         const [probeA, probeB] = await Promise.all([probeMedia(aPath), probeMedia(bPath)]);
         if (probeA.hasVideo && probeB.hasVideo && probeA.durationSec > 0 && probeB.durationSec > 0) {
+          const recoveredShortNumber = normalizeShortNumber(status?.shortNumber, 1);
+          const recoveredNames = buildShortExportFileNames(recoveredShortNumber);
           const recovered = {
             jobId,
+            shortNumber: recoveredShortNumber,
             createdAt: new Date(Number(jobId.replace('job_', '')) || Date.now()).toISOString(),
             mainDurationSec: Number(Math.max(0, probeA.durationSec - 2).toFixed(2)),
             endplateDurationSec: 2.0,
@@ -588,14 +775,14 @@ async function getLatestCompletedExport() {
               version: 'A' as const,
               title: 'Версия А — основная (MP4, H.264/AAC, речь + музыка + звуковой логотип)',
               url: `/api/download-export/${jobId}/version_a.mp4`,
-              fileName: 'delo_v_kadre_short_01_version_A.mp4',
+              fileName: recoveredNames.versionA,
               probe: probeA,
             },
             versionB: {
               version: 'B' as const,
               title: 'Версия Б — без музыки (MP4, H.264/AAC, речь + тишина на заставке)',
               url: `/api/download-export/${jobId}/version_b.mp4`,
-              fileName: 'delo_v_kadre_short_01_version_B.mp4',
+              fileName: recoveredNames.versionB,
               probe: probeB,
             },
           };
@@ -830,6 +1017,8 @@ async function startServer() {
           for (const key of Object.keys(savedAssetRecords) as SourceRole[]) {
             delete savedAssetRecords[key];
           }
+          activeLibraryItems.clear();
+          savedLibraryRecords.clear();
           exportJobs.clear();
           adManager.resetInMemory({ clearPresets });
         },
@@ -847,9 +1036,10 @@ async function startServer() {
 
   app.get('/api/project-state', async (_req, res) => {
     try {
-      const [preloaded, uploadedSync, latestExport, exportHistory] = await Promise.all([
+      const [preloaded, uploadedSync, librarySync, latestExport, exportHistory] = await Promise.all([
         getPreloadedAssets(),
         syncUploadedAssetsAvailability(),
+        syncLibraryAvailability(),
         getLatestCompletedExport(),
         getExportHistory(),
       ]);
@@ -857,6 +1047,8 @@ async function startServer() {
         preloaded,
         uploaded: uploadedSync.available,
         missingUploaded: uploadedSync.missing,
+        library: librarySync.items,
+        missingLibrary: librarySync.missingItems,
         latestExport,
         exportHistory,
         storage: getStorageEnvironmentInfo(),
@@ -884,7 +1076,8 @@ async function startServer() {
 
   interface ChunkUploadSession {
     uploadId: string;
-    role: SourceRole;
+    mode: 'legacy' | 'library';
+    role?: SourceRole;
     originalName: string;
     mimeType: string;
     totalSizeBytes: number;
@@ -899,6 +1092,7 @@ async function startServer() {
   const isFileReferencedElsewhere = (
     targetFilePath: string | undefined,
     excludedRoles: Set<SourceRole>,
+    excludedLibraryIds: Set<string> = new Set(),
   ): boolean => {
     if (!targetFilePath) return false;
     const normalizedTarget = path.resolve(targetFilePath);
@@ -908,7 +1102,59 @@ async function startServer() {
         return true;
       }
     }
+    for (const [id, item] of savedLibraryRecords.entries()) {
+      if (excludedLibraryIds.has(id) || !item?.filePath) continue;
+      if (path.resolve(item.filePath) === normalizedTarget) {
+        return true;
+      }
+    }
     return false;
+  };
+
+  const finalizeLibraryVideoUpload = async (params: {
+    filePath: string;
+    fileName: string;
+    originalName: string;
+    mimeType: string;
+  }): Promise<SourceLibraryItem> => {
+    const { filePath, fileName, originalName, mimeType } = params;
+    const probe = await probeMedia(filePath);
+    if (!probe.hasVideo) {
+      if (fs.existsSync(filePath) && isInsideUploadsDir(filePath)) {
+        try {
+          fs.unlinkSync(filePath);
+        } catch {
+          // ignore
+        }
+      }
+      throw new Error(`Файл «${originalName}» не содержит видеодорожки.`);
+    }
+
+    const id = `src_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const metadata = parseSourceFilenameMetadata(originalName);
+    const warnings: string[] = [];
+    if (!probe.hasAudio) {
+      warnings.push('В файле не обнаружена аудиодорожка.');
+    }
+
+    const item: SourceLibraryItem = {
+      id,
+      fileName,
+      originalName,
+      url: `/uploads/${fileName}`,
+      filePath,
+      mimeType,
+      probe,
+      warnings,
+      uploadedAt: new Date().toISOString(),
+      metadata,
+    };
+
+    savedLibraryRecords.set(id, item);
+    activeLibraryItems.set(id, item);
+    saveLibraryState();
+    await uploadFileToCloud(filePath, `uploads/${fileName}`, mimeType || 'video/mp4');
+    return item;
   };
 
   const finalizeUploadedClip = async (params: {
@@ -942,7 +1188,7 @@ async function startServer() {
     }
 
     for (const [oldPath, oldFileName] of obsoleteFiles.entries()) {
-      if (fs.existsSync(oldPath)) {
+      if (fs.existsSync(oldPath) && isInsideUploadsDir(oldPath)) {
         try {
           fs.unlinkSync(oldPath);
         } catch {
@@ -968,14 +1214,284 @@ async function startServer() {
       uploadedAssets[targetRole] = asset;
       savedAssetRecords[targetRole] = asset;
       assignedAssets[targetRole] = asset;
+
+      if (targetRole === 'fragment8' || targetRole === 'fragment9') {
+        const legacyLibId = `src_legacy_${targetRole}`;
+        const libItem: SourceLibraryItem = {
+          id: legacyLibId,
+          fileName,
+          originalName,
+          url: `/uploads/${fileName}`,
+          filePath,
+          mimeType,
+          probe,
+          warnings: asset.warnings,
+          uploadedAt: new Date().toISOString(),
+          legacyRole: targetRole,
+          metadata: parseSourceFilenameMetadata(originalName),
+        };
+        savedLibraryRecords.set(legacyLibId, libItem);
+        activeLibraryItems.set(legacyLibId, libItem);
+      }
     }
 
     saveUploadedState();
+    saveLibraryState();
     await uploadFileToCloud(filePath, `uploads/${fileName}`, mimeType || 'application/octet-stream');
 
     const primaryAsset = assignedAssets[role] ?? Object.values(assignedAssets)[0]!;
     return { asset: primaryAsset, assignedAssets };
   };
+
+  // --- Source Video Library API ---
+  app.get('/api/library', async (_req, res) => {
+    try {
+      const sync = await syncLibraryAvailability();
+      res.json(sync);
+    } catch (error) {
+      res.status(500).json({
+        error: error instanceof Error ? error.message : 'Ошибка чтения библиотеки исходников.',
+      });
+    }
+  });
+
+  app.post('/api/library/upload', upload.single('file'), async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: 'Видеофайл не получен.' });
+      }
+      const originalName = normalizeMulterOriginalName(req.file.originalname);
+      if (!isAllowedVideoUpload(originalName, req.file.mimetype)) {
+        if (fs.existsSync(req.file.path) && isInsideUploadsDir(req.file.path)) {
+          fs.unlinkSync(req.file.path);
+        }
+        return res.status(400).json({
+          error: 'Поддерживаются только видеофайлы (MP4, MOV, MKV, AVI, WEBM, M4V).',
+        });
+      }
+
+      const item = await finalizeLibraryVideoUpload({
+        filePath: req.file.path,
+        fileName: req.file.filename,
+        originalName,
+        mimeType: req.file.mimetype || 'video/mp4',
+      });
+      res.json({ item });
+    } catch (error) {
+      if (req.file?.path && fs.existsSync(req.file.path) && isInsideUploadsDir(req.file.path)) {
+        try {
+          fs.unlinkSync(req.file.path);
+        } catch {
+          // ignore
+        }
+      }
+      res.status(500).json({
+        error: error instanceof Error ? error.message : 'Ошибка загрузки видео в библиотеку.',
+      });
+    }
+  });
+
+  app.post('/api/library/upload/init', (req, res) => {
+    try {
+      const { originalName, mimeType, totalSizeBytes, totalChunks } = req.body as {
+        originalName?: string;
+        mimeType?: string;
+        totalSizeBytes?: number;
+        totalChunks?: number;
+      };
+      if (!originalName || typeof originalName !== 'string') {
+        return res.status(400).json({ error: 'Не указано имя видеофайла.' });
+      }
+      if (!isAllowedVideoUpload(originalName, mimeType || 'video/mp4')) {
+        return res.status(400).json({
+          error: 'Поддерживаются только видеофайлы (MP4, MOV, MKV, AVI, WEBM, M4V).',
+        });
+      }
+      if (!totalChunks || !Number.isInteger(totalChunks) || totalChunks < 1 || totalChunks > 4000) {
+        return res.status(400).json({ error: 'Некорректное количество фрагментов загрузки.' });
+      }
+
+      const uploadId = `libup_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const tempDir = path.join(TEMP_DIR, uploadId);
+      fs.mkdirSync(tempDir, { recursive: true });
+
+      chunkUploadSessions.set(uploadId, {
+        uploadId,
+        mode: 'library',
+        originalName: path.basename(originalName),
+        mimeType: mimeType || 'video/mp4',
+        totalSizeBytes: Number(totalSizeBytes ?? 0),
+        totalChunks,
+        assignBothSlots: false,
+        tempDir,
+        createdAt: Date.now(),
+      });
+
+      res.json({ uploadId });
+    } catch (error) {
+      res.status(500).json({
+        error: error instanceof Error ? error.message : 'Не удалось инициализировать загрузку видео.',
+      });
+    }
+  });
+
+  app.post(
+    '/api/library/upload/chunk/:uploadId/:chunkIndex',
+    express.raw({ type: 'application/octet-stream', limit: '8mb' }),
+    (req, res) => {
+      try {
+        const { uploadId, chunkIndex } = req.params;
+        if (!/^[a-zA-Z0-9_-]{4,80}$/.test(uploadId)) {
+          return res.status(400).json({ error: 'Некорректный uploadId.' });
+        }
+        const session = chunkUploadSessions.get(uploadId);
+        if (!session || session.mode !== 'library') {
+          return res.status(404).json({ error: 'Сессия загрузки не найдена или истекла.' });
+        }
+        const idx = Number(chunkIndex);
+        if (!Number.isInteger(idx) || idx < 0 || idx >= session.totalChunks) {
+          return res.status(400).json({ error: 'Некорректный номер фрагмента загрузки.' });
+        }
+        if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+          return res.status(400).json({ error: 'Пустой фрагмент файла.' });
+        }
+
+        const partPath = path.join(session.tempDir, `chunk_${String(idx).padStart(6, '0')}.part`);
+        fs.writeFileSync(partPath, req.body);
+        res.json({ ok: true, index: idx, bytes: req.body.length });
+      } catch (error) {
+        res.status(500).json({
+          error: error instanceof Error ? error.message : 'Ошибка записи фрагмента файла на сервер.',
+        });
+      }
+    },
+  );
+
+  app.post('/api/library/upload/complete', async (req, res) => {
+    const { uploadId } = req.body as { uploadId?: string };
+    if (!uploadId || !/^[a-zA-Z0-9_-]{4,80}$/.test(uploadId)) {
+      return res.status(400).json({ error: 'Некорректный uploadId.' });
+    }
+    const session = chunkUploadSessions.get(uploadId);
+    if (!session || session.mode !== 'library') {
+      return res.status(404).json({ error: 'Сессия загрузки не найдена или уже завершена.' });
+    }
+
+    const ext = sanitizeVideoExtension(session.originalName);
+    const fileName = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`;
+    const destPath = path.join(UPLOADS_DIR, fileName);
+
+    try {
+      fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+      const writeFd = fs.openSync(destPath, 'w');
+      try {
+        for (let i = 0; i < session.totalChunks; i += 1) {
+          const partPath = path.join(session.tempDir, `chunk_${String(i).padStart(6, '0')}.part`);
+          if (!fs.existsSync(partPath)) {
+            throw new Error(`Отсутствует фрагмент загрузки #${i + 1} из ${session.totalChunks}.`);
+          }
+          const chunkBuf = fs.readFileSync(partPath);
+          fs.writeSync(writeFd, chunkBuf);
+        }
+      } finally {
+        fs.closeSync(writeFd);
+      }
+
+      const item = await finalizeLibraryVideoUpload({
+        filePath: destPath,
+        fileName,
+        originalName: session.originalName,
+        mimeType: session.mimeType,
+      });
+
+      res.json({ item });
+    } catch (error) {
+      if (fs.existsSync(destPath) && isInsideUploadsDir(destPath)) {
+        try {
+          fs.unlinkSync(destPath);
+        } catch {
+          // ignore
+        }
+      }
+      res.status(500).json({
+        error: error instanceof Error ? error.message : 'Ошибка сборки загруженного видео.',
+      });
+    } finally {
+      chunkUploadSessions.delete(uploadId);
+      try {
+        fs.rmSync(session.tempDir, { recursive: true, force: true });
+      } catch {
+        // ignore
+      }
+    }
+  });
+
+  app.patch('/api/library/:id', (req, res) => {
+    const id = String(req.params.id ?? '');
+    if (!isValidLibraryId(id)) {
+      return res.status(400).json({ error: 'Некорректный идентификатор исходника.' });
+    }
+    const existing = savedLibraryRecords.get(id);
+    if (!existing) {
+      return res.status(404).json({ error: 'Исходник в библиотеке не найден.' });
+    }
+    const updatedMetadata = reconcileSourceMetadata(req.body ?? {}, existing.metadata);
+    const updated: SourceLibraryItem = {
+      ...existing,
+      metadata: updatedMetadata,
+    };
+    savedLibraryRecords.set(id, updated);
+    if (activeLibraryItems.has(id)) {
+      activeLibraryItems.set(id, updated);
+    }
+    saveLibraryState();
+    res.json({ item: updated });
+  });
+
+  app.delete('/api/library/:id', (req, res) => {
+    const id = String(req.params.id ?? '');
+    if (!isValidLibraryId(id)) {
+      return res.status(400).json({ error: 'Некорректный идентификатор исходника.' });
+    }
+    const existing = savedLibraryRecords.get(id);
+    if (!existing) {
+      return res.status(404).json({ error: 'Исходник не найден в библиотеке.' });
+    }
+
+    const referencedElsewhere = isFileReferencedElsewhere(
+      existing.filePath,
+      new Set(existing.legacyRole ? [existing.legacyRole] : []),
+      new Set([id]),
+    );
+
+    if (!referencedElsewhere && existing.filePath && isInsideUploadsDir(existing.filePath)) {
+      if (fs.existsSync(existing.filePath)) {
+        try {
+          fs.unlinkSync(existing.filePath);
+        } catch {
+          // ignore unlink error
+        }
+      }
+    }
+    if (!referencedElsewhere && existing.fileName) {
+      void deleteCloudObject(`uploads/${existing.fileName}`);
+    }
+
+    if (
+      existing.legacyRole &&
+      savedAssetRecords[existing.legacyRole]?.filePath &&
+      path.resolve(savedAssetRecords[existing.legacyRole]!.filePath) === path.resolve(existing.filePath)
+    ) {
+      delete uploadedAssets[existing.legacyRole];
+      delete savedAssetRecords[existing.legacyRole];
+      saveUploadedState();
+    }
+
+    savedLibraryRecords.delete(id);
+    activeLibraryItems.delete(id);
+    saveLibraryState();
+    res.json({ ok: true, deletedId: id });
+  });
 
   app.post('/api/upload-clip', upload.single('file'), async (req, res) => {
     try {
@@ -994,7 +1510,7 @@ async function startServer() {
         role,
         filePath: req.file.path,
         fileName: req.file.filename,
-        originalName: req.file.originalname,
+        originalName: normalizeMulterOriginalName(req.file.originalname),
         mimeType: req.file.mimetype || 'application/octet-stream',
         assignBothSlots,
       });
@@ -1028,6 +1544,7 @@ async function startServer() {
 
       chunkUploadSessions.set(uploadId, {
         uploadId,
+        mode: 'legacy',
         role,
         originalName,
         mimeType: mimeType || 'application/octet-stream',
@@ -1106,7 +1623,7 @@ async function startServer() {
       }
 
       const result = await finalizeUploadedClip({
-        role: session.role,
+        role: session.role!,
         filePath: destPath,
         fileName,
         originalName: session.originalName,
@@ -1195,9 +1712,14 @@ async function startServer() {
   app.delete('/api/upload-clip/:role', (req, res) => {
     const role = req.params.role as SourceRole;
     const existing = savedAssetRecords[role] ?? uploadedAssets[role];
-    const sharedElsewhere = isFileReferencedElsewhere(existing?.filePath, new Set([role]));
+    const legacyLibId = `src_legacy_${role}`;
+    const sharedElsewhere = isFileReferencedElsewhere(
+      existing?.filePath,
+      new Set([role]),
+      new Set([legacyLibId]),
+    );
 
-    if (!sharedElsewhere && existing && fs.existsSync(existing.filePath)) {
+    if (!sharedElsewhere && existing && isInsideUploadsDir(existing.filePath) && fs.existsSync(existing.filePath)) {
       try {
         fs.unlinkSync(existing.filePath);
       } catch {
@@ -1209,7 +1731,10 @@ async function startServer() {
     }
     delete uploadedAssets[role];
     delete savedAssetRecords[role];
+    savedLibraryRecords.delete(legacyLibId);
+    activeLibraryItems.delete(legacyLibId);
     saveUploadedState();
+    saveLibraryState();
     res.json({ ok: true });
   });
 
@@ -1226,6 +1751,7 @@ async function startServer() {
           fragment8: uploadedAssets.fragment8,
           fragment9: uploadedAssets.fragment9,
         },
+        libraryItems: Array.from(activeLibraryItems.values()),
         workDir,
       });
 
@@ -1247,11 +1773,21 @@ async function startServer() {
         return res.status(400).json({ error: 'Таймлайн пуст. Добавьте хотя бы один сегмент.' });
       }
 
-      const neededRoles = new Set(payload.segments.map((s) => s.sourceRole));
-      for (const r of neededRoles) {
-        if (!uploadedAssets[r]) {
+      const librarySnapshot = Array.from(activeLibraryItems.values());
+      const assetsSnapshot = { ...uploadedAssets };
+
+      for (const seg of payload.segments) {
+        const resolved = resolveSegmentMediaAsset(seg, librarySnapshot, assetsSnapshot);
+        if (!resolved) {
+          const fallbackLabel = seg.sourceId
+            ? `исходник ${seg.sourceId}`
+            : seg.sourceRole === 'fragment8'
+              ? 'Фрагмент 8'
+              : seg.sourceRole === 'fragment9'
+                ? 'Фрагмент 9'
+                : 'источник не выбран';
           return res.status(400).json({
-            error: `Отсутствует исходный видеофайл для "${r === 'fragment8' ? 'Фрагмент 8' : 'Фрагмент 9'}". Загрузите оригинальное видео перед экспортом.`,
+            error: `Отсутствует исходный видеофайл для сегмента «${seg.beatTitle}» (${fallbackLabel}). Выберите или загрузите видео в библиотеке перед экспортом.`,
           });
         }
       }
@@ -1293,12 +1829,14 @@ async function startServer() {
         }
       }
 
+      const resolvedShortNumber = normalizeShortNumber(payload.shortNumber, 1);
       const jobId = `job_${Date.now()}`;
       const jobDir = path.join(EXPORTS_DIR, jobId);
       const now = new Date().toISOString();
 
       const jobState: ExportJobStatus = {
         jobId,
+        shortNumber: resolvedShortNumber,
         status: 'running',
         stageIndex: 0,
         totalStages: 6,
@@ -1310,15 +1848,15 @@ async function startServer() {
       exportJobs.set(jobId, jobState);
       saveJobStatus(jobState);
 
-      const assetsSnapshot = { ...uploadedAssets };
-
       void renderDualShortsExport({
         jobId,
+        shortNumber: resolvedShortNumber,
         jobDir,
         exportBaseUrl: '/api/download-export',
         segments: payload.segments,
         subtitles: payload.subtitles ?? [],
         assets: assetsSnapshot,
+        libraryItems: librarySnapshot,
         overlayPathMap,
         overlayPlacementMap,
         endplatePath,
@@ -1327,6 +1865,7 @@ async function startServer() {
         audioLogoPath,
         useUploadedMusic: Boolean(payload.useUploadedMusic),
         musicGainDb: Number(payload.musicGainDb ?? -22),
+        includeVersionB: payload.includeVersionB !== false,
         adLayers: Array.isArray(payload.adLayers) ? payload.adLayers : [],
         adAssetsMap: adManager.getAssetPathMap(),
         adAudioAssetsMap: adManager.getAudioAssetPathMap(),
@@ -1346,10 +1885,15 @@ async function startServer() {
         },
       })
         .then(async (result) => {
-          await Promise.all([
+          const uploads = [
             uploadFileToCloud(path.join(jobDir, 'version_a.mp4'), `exports/${jobId}/version_a.mp4`, 'video/mp4'),
-            uploadFileToCloud(path.join(jobDir, 'version_b.mp4'), `exports/${jobId}/version_b.mp4`, 'video/mp4'),
-          ]);
+          ];
+          if (result.versionB) {
+            uploads.push(
+              uploadFileToCloud(path.join(jobDir, 'version_b.mp4'), `exports/${jobId}/version_b.mp4`, 'video/mp4'),
+            );
+          }
+          await Promise.all(uploads);
 
           const cur = exportJobs.get(jobId);
           const done: ExportJobStatus = {
@@ -1358,7 +1902,9 @@ async function startServer() {
             stageIndex: 6,
             totalStages: 6,
             stageLabel: 'Экспорт завершён',
-            detail: 'Готовы файлы Версия А и Версия Б (MP4, H.264/AAC)',
+            detail: result.versionB
+              ? 'Готовы файлы Версия А и Версия Б (MP4, H.264/AAC)'
+              : 'Готов файл Версия А (MP4, H.264/AAC)',
             updatedAt: new Date().toISOString(),
             result,
           };
@@ -1419,10 +1965,11 @@ async function startServer() {
     }
 
     const totalSize = fileCheck.sizeBytes;
-    const downloadName =
-      file === 'version_a.mp4'
-        ? 'delo_v_kadre_short_01_version_A.mp4'
-        : 'delo_v_kadre_short_01_version_B.mp4';
+    const jobStatus = readJobStatus(jobId);
+    const downloadName = resolveExportDownloadFileName({
+      file: file as 'version_a.mp4' | 'version_b.mp4',
+      jobStatus,
+    });
 
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Cache-Control', 'no-store');
@@ -1529,6 +2076,54 @@ async function startServer() {
     } catch (error) {
       res.status(500).json({
         error: error instanceof Error ? error.message : 'Ошибка генерации обложки.',
+      });
+    }
+  });
+
+  app.post('/api/auto-frame', async (req, res) => {
+    try {
+      const { segments } = req.body as {
+        segments?: Array<{
+          id: string;
+          sourceId?: string;
+          sourceRole?: 'fragment8' | 'fragment9';
+          startSec: number;
+          endSec: number;
+        }>;
+      };
+      if (!Array.isArray(segments) || segments.length === 0) {
+        return res.json({ results: {} });
+      }
+
+      const librarySnapshot = Array.from(activeLibraryItems.values());
+      const results: Record<string, SegmentAutoFrameResult> = {};
+      for (const seg of segments) {
+        const asset = resolveSegmentMediaAsset(seg, librarySnapshot, uploadedAssets);
+        if (!asset || !fs.existsSync(asset.filePath)) continue;
+        const startSec = Math.max(0, Number(seg.startSec) || 0);
+        const endSec = Math.min(
+          asset.probe.durationSec || Number(seg.endSec) || startSec + 1,
+          Math.max(startSec + 0.2, Number(seg.endSec) || startSec + 1),
+        );
+        if (endSec - startSec < 0.2) continue;
+        try {
+          results[seg.id] = await analyzeSegmentAutoFraming({
+            filePath: asset.filePath,
+            sizeBytes: asset.probe.sizeBytes,
+            srcWidth: asset.probe.width || 1920,
+            srcHeight: asset.probe.height || 1080,
+            startSec,
+            endSec,
+            segmentId: seg.id,
+          });
+        } catch {
+          // skip failed single segment analysis without failing whole request
+        }
+      }
+      res.json({ results });
+    } catch (error) {
+      res.status(500).json({
+        error: error instanceof Error ? error.message : 'Ошибка автоматического анализа кадрирования.',
       });
     }
   });

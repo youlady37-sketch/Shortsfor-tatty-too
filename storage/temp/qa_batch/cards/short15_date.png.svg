@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="154" viewBox="0 0 860 154">
+  <defs>
+    <clipPath id="cardClip">
+      <rect x="2" y="2" width="856" height="150" rx="14" ry="14"/>
+    </clipPath>
+  </defs>
+  <g clip-path="url(#cardClip)">
+    <rect x="2" y="2" width="856" height="150" fill="#232933" fill-opacity="0.96"/>
+    <rect x="2" y="2" width="16" height="150" fill="#9A1B1B"/>
+  </g>
+  <rect x="2" y="2" width="856" height="150" rx="14" ry="14" fill="none" stroke="#475569" stroke-width="2"/>
+  <text x="44" y="75" font-family="Noto Sans" font-weight="700" font-size="44" fill="#FFFFFF">30 ОКТЯБРЯ 1982 ГОДА</text>
+  <text x="44" y="120" font-family="Noto Sans" font-weight="400" font-size="28" fill="#B8C2D1">Задержание Соколова в кабинете</text>
+</svg>

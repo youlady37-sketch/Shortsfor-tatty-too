@@ -1,0 +1,8 @@
+frame=    1 fps=0.0 q=-0.0 size=N/A time=00:00:00.23 bitrate=N/A speed=18.4x    [silencedetect @ 0x556639cb75c0] silence_start: 2.12625
+[silencedetect @ 0x556639cb75c0] silence_end: 2.43125 | silence_duration: 0.305
+[silencedetect @ 0x556639cb75c0] silence_start: 2.43179
+[silencedetect @ 0x556639cb75c0] silence_end: 2.72517 | silence_duration: 0.293375
+[silencedetect @ 0x556639cb75c0] silence_start: 16.3456
+[silencedetect @ 0x556639cb75c0] silence_end: 17.0125 | silence_duration: 0.666875
+frame=  484 fps=0.0 q=-0.0 size=N/A time=00:00:19.54 bitrate=N/A speed=38.1x    [silencedetect @ 0x556639cb75c0] silence_start: 21.2387
+[silencedetect @ 0x556639cb75c0] silence_end: 21.4872 | silence_duration: 0.248479

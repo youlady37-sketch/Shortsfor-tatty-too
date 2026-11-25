@@ -301,6 +301,7 @@ export function isForbiddenProtectedCandidate(relativePath: string): boolean {
     normalized.startsWith('storage/temp/') ||
     normalized.startsWith('storage/ads/') ||
     normalized === 'storage/uploaded_state.json' ||
+    normalized === 'storage/library_state.json' ||
     normalized === 'storage/ad_state.json'
   ) {
     return true;

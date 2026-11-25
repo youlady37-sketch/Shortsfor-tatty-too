@@ -2,7 +2,10 @@ import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { analyzeSegmentAutoFraming, buildDynamicCropXExpr } from './autoFraming.ts';
 import { computeAdOverlayBox } from '../utils/adGeometry.ts';
+import { buildShortExportFileNames, normalizeShortNumber } from '../shared/exportNaming.ts';
+import { resolveSegmentMediaAsset } from '../shared/sourceLibrary.ts';
 import type {
   AdAssetInfo,
   AdAudioAssetInfo,
@@ -11,6 +14,7 @@ import type {
   ExportJobResult,
   MediaProbeInfo,
   OverlayPlacementMode,
+  SourceLibraryItem,
   SubtitleCue,
   UploadedAsset,
 } from '../types.ts';
@@ -118,17 +122,20 @@ export function buildAssSubtitles(cues: SubtitleCue[]): string {
 export async function extractTimelineAudioForTranscription(params: {
   segments: CutSegment[];
   assets: Partial<Record<'fragment8' | 'fragment9', UploadedAsset>>;
+  libraryItems?: SourceLibraryItem[];
   workDir: string;
 }): Promise<string> {
-  const { segments, assets, workDir } = params;
+  const { segments, assets, libraryItems = [], workDir } = params;
   fs.mkdirSync(workDir, { recursive: true });
 
   const audioParts: string[] = [];
   for (let i = 0; i < segments.length; i += 1) {
     const seg = segments[i];
-    const asset = assets[seg.sourceRole];
+    const asset = resolveSegmentMediaAsset(seg, libraryItems, assets);
     if (!asset) {
-      throw new Error(`Не загружен видеофайл для источника: ${seg.sourceRole}`);
+      throw new Error(
+        `Не загружен видеофайл для сегмента "${seg.beatTitle}" (${seg.sourceId ?? seg.sourceRole ?? 'источник не выбран'}).`,
+      );
     }
     const dur = Math.max(0.1, seg.endSec - seg.startSec);
     const outPart = path.join(workDir, `part_${i}.mp3`);
@@ -456,11 +463,13 @@ export async function buildAdAudioMasterWav(params: {
 
 export async function renderDualShortsExport(params: {
   jobId: string;
+  shortNumber?: number;
   jobDir: string;
   exportBaseUrl: string;
   segments: CutSegment[];
   subtitles: SubtitleCue[];
   assets: Partial<Record<'fragment8' | 'fragment9' | 'music' | 'endplate' | 'audioLogo', UploadedAsset>>;
+  libraryItems?: SourceLibraryItem[];
   overlayPathMap: Record<string, string>;
   overlayPlacementMap?: Record<string, OverlayPlacementMode>;
   endplatePath: string;
@@ -469,6 +478,7 @@ export async function renderDualShortsExport(params: {
   audioLogoPath: string;
   useUploadedMusic: boolean;
   musicGainDb: number;
+  includeVersionB?: boolean;
   adLayers?: AdOverlayLayer[];
   adAssetsMap?: Record<string, AdAssetInfo>;
   adAudioAssetsMap?: Record<string, AdAudioAssetInfo>;
@@ -476,11 +486,13 @@ export async function renderDualShortsExport(params: {
 }): Promise<ExportJobResult> {
   const {
     jobId,
+    shortNumber,
     jobDir,
     exportBaseUrl,
     segments,
     subtitles,
     assets,
+    libraryItems = [],
     overlayPathMap,
     overlayPlacementMap = {},
     endplatePath,
@@ -489,6 +501,7 @@ export async function renderDualShortsExport(params: {
     audioLogoPath,
     useUploadedMusic,
     musicGainDb,
+    includeVersionB = true,
     adLayers = [],
     adAssetsMap = {},
     adAudioAssetsMap = {},
@@ -510,7 +523,7 @@ export async function renderDualShortsExport(params: {
   }
 
   // Determine target FPS from first available source video
-  const firstAsset = assets[segments[0].sourceRole];
+  const firstAsset = resolveSegmentMediaAsset(segments[0], libraryItems, assets);
   if (!firstAsset) {
     throw new Error('Отсутствует исходный видеофайл для первого сегмента.');
   }
@@ -527,9 +540,11 @@ export async function renderDualShortsExport(params: {
       'Нарезка и вертикальное кадрирование 9:16',
       `Сегмент ${i + 1} из ${segments.length}: ${seg.beatTitle}`,
     );
-    const asset = assets[seg.sourceRole];
+    const asset = resolveSegmentMediaAsset(seg, libraryItems, assets);
     if (!asset) {
-      throw new Error(`Отсутствует загруженный файл для роли ${seg.sourceRole}.`);
+      throw new Error(
+        `Отсутствует загруженный видеофайл для сегмента "${seg.beatTitle}" (${seg.sourceId ?? seg.sourceRole ?? 'источник не выбран'}).`,
+      );
     }
     const segDur = Number((seg.endSec - seg.startSec).toFixed(3));
     if (segDur <= 0.1) {
@@ -547,20 +562,69 @@ export async function renderDualShortsExport(params: {
     const srcH = asset.probe.height || 1080;
     let cropW: number;
     let cropH: number;
-    let cropX: number;
+    let cropXStatic = 0;
+    let cropXDynamicExpr: string | null = null;
     let cropY: number;
+
+    const isAutoFraming = seg.framingMode !== 'manual';
 
     if (srcW / srcH > 9 / 16) {
       cropH = Math.floor(srcH / 2) * 2;
       cropW = Math.floor(((cropH * 9) / 16) / 2) * 2;
       const maxX = Math.max(0, srcW - cropW);
-      cropX = Math.min(maxX, Math.max(0, Math.round(((seg.cropOffsetX + 100) / 200) * maxX)));
       cropY = 0;
+
+      if (isAutoFraming) {
+        try {
+          const autoFrame = await analyzeSegmentAutoFraming({
+            filePath: asset.filePath,
+            sizeBytes: asset.probe.sizeBytes,
+            srcWidth: srcW,
+            srcHeight: srcH,
+            startSec: seg.startSec,
+            endSec: seg.endSec,
+            segmentId: seg.id,
+          });
+          const dynamicCrop = buildDynamicCropXExpr({
+            keyframes: autoFrame.keyframes,
+            srcW,
+            cropW,
+          });
+          cropXStatic = dynamicCrop.staticX;
+          cropXDynamicExpr = dynamicCrop.isDynamic ? dynamicCrop.xExpr : null;
+        } catch {
+          cropXStatic = Math.min(maxX, Math.max(0, Math.round(((seg.cropOffsetX + 100) / 200) * maxX)));
+        }
+      } else {
+        cropXStatic = Math.min(maxX, Math.max(0, Math.round(((seg.cropOffsetX + 100) / 200) * maxX)));
+      }
     } else {
       cropW = Math.floor(srcW / 2) * 2;
       cropH = Math.min(srcH, Math.floor(((cropW * 16) / 9) / 2) * 2);
-      cropX = 0;
-      cropY = Math.max(0, Math.round((srcH - cropH) / 2));
+      cropXStatic = 0;
+      const maxY = Math.max(0, srcH - cropH);
+      cropY = Math.max(0, Math.round(maxY / 2));
+
+      if (isAutoFraming && maxY > 4) {
+        try {
+          const autoFrame = await analyzeSegmentAutoFraming({
+            filePath: asset.filePath,
+            sizeBytes: asset.probe.sizeBytes,
+            srcWidth: srcW,
+            srcHeight: srcH,
+            startSec: seg.startSec,
+            endSec: seg.endSec,
+            segmentId: seg.id,
+          });
+          const avgCenterY =
+            autoFrame.keyframes.length > 0
+              ? autoFrame.keyframes.reduce((acc, k) => acc + k.centerYNorm, 0) / autoFrame.keyframes.length
+              : 0.5;
+          cropY = Math.min(maxY, Math.max(0, Math.round(avgCenterY * srcH - cropH / 2)));
+        } catch {
+          // keep centered vertical fallback
+        }
+      }
     }
 
     const segOut = path.join(jobDir, `seg_${i}.mkv`);
@@ -584,8 +648,12 @@ export async function renderDualShortsExport(params: {
       inputArgs.push('-loop', '1', '-t', String(segDur), '-i', overlayPath);
     }
 
+    const cropFilter = cropXDynamicExpr
+      ? `setpts=PTS-STARTPTS,crop=w=${cropW}:h=${cropH}:x='${cropXDynamicExpr}':y=${cropY}`
+      : `crop=${cropW}:${cropH}:${cropXStatic}:${cropY}`;
+
     const filterParts: string[] = [
-      `[0:v]crop=${cropW}:${cropH}:${cropX}:${cropY},scale=1080:1920:flags=lanczos,fps=${targetFps},setsar=1,format=yuv420p[vbase]`,
+      `[0:v]${cropFilter},scale=1080:1920:flags=lanczos,fps=${targetFps},setsar=1,format=yuv420p[vbase]`,
     ];
 
     let videoMap = '[vbase]';
@@ -801,115 +869,123 @@ export async function renderDualShortsExport(params: {
   });
   const totalDurationExactSec = Number((mainDurationSec + endplateDurationSec).toFixed(3));
 
-  // Step 5: Build Version B (Без музыки, без звукового логотипа + опциональное рекламное аудио)
-  report(5, 'Кодирование Версии Б (MP4 H.264/AAC)', 'Без музыки и без звукового логотипа');
-  if (adAudioMasterPath) {
-    await runCommand(
-      'ffmpeg',
-      [
-        '-y',
-        '-i',
-        masterVideoFileName,
-        '-i',
-        'main_audio.wav',
-        '-f',
-        'lavfi',
-        '-t',
-        String(endplateDurationSec),
-        '-i',
-        'anullsrc=channel_layout=stereo:sample_rate=48000',
-        '-i',
-        path.basename(adAudioMasterPath),
-        '-filter_complex',
-        '[1:a][2:a]concat=n=2:v=0:a=1[bbase];[bbase][3:a]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,alimiter=level_in=1:level_out=1:limit=0.95:attack=5:release=50[aout]',
-        '-map',
-        '0:v',
-        '-map',
-        '[aout]',
-        '-t',
-        totalDurationExactSec.toFixed(3),
-        '-c:v',
-        'libx264',
-        '-preset',
-        'fast',
-        '-crf',
-        '18',
-        '-profile:v',
-        'high',
-        '-level',
-        '4.2',
-        '-pix_fmt',
-        'yuv420p',
-        '-c:a',
-        'aac',
-        '-b:a',
-        '192k',
-        '-ar',
-        '48000',
-        '-movflags',
-        '+faststart',
-        'version_b.mp4',
-      ],
-      jobDir,
-    );
+  // Step 5: Build Version B (только если includeVersionB !== false)
+  if (includeVersionB) {
+    report(5, 'Кодирование Версии Б (MP4 H.264/AAC)', 'Без музыки и без звукового логотипа');
+    if (adAudioMasterPath) {
+      await runCommand(
+        'ffmpeg',
+        [
+          '-y',
+          '-i',
+          masterVideoFileName,
+          '-i',
+          'main_audio.wav',
+          '-f',
+          'lavfi',
+          '-t',
+          String(endplateDurationSec),
+          '-i',
+          'anullsrc=channel_layout=stereo:sample_rate=48000',
+          '-i',
+          path.basename(adAudioMasterPath),
+          '-filter_complex',
+          '[1:a][2:a]concat=n=2:v=0:a=1[bbase];[bbase][3:a]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,alimiter=level_in=1:level_out=1:limit=0.95:attack=5:release=50[aout]',
+          '-map',
+          '0:v',
+          '-map',
+          '[aout]',
+          '-t',
+          totalDurationExactSec.toFixed(3),
+          '-c:v',
+          'libx264',
+          '-preset',
+          'fast',
+          '-crf',
+          '18',
+          '-profile:v',
+          'high',
+          '-level',
+          '4.2',
+          '-pix_fmt',
+          'yuv420p',
+          '-c:a',
+          'aac',
+          '-b:a',
+          '192k',
+          '-ar',
+          '48000',
+          '-movflags',
+          '+faststart',
+          'version_b.mp4',
+        ],
+        jobDir,
+      );
+    } else {
+      await runCommand(
+        'ffmpeg',
+        [
+          '-y',
+          '-i',
+          masterVideoFileName,
+          '-i',
+          'main_audio.wav',
+          '-f',
+          'lavfi',
+          '-t',
+          String(endplateDurationSec),
+          '-i',
+          'anullsrc=channel_layout=stereo:sample_rate=48000',
+          '-filter_complex',
+          '[1:a][2:a]concat=n=2:v=0:a=1[aout]',
+          '-map',
+          '0:v',
+          '-map',
+          '[aout]',
+          '-c:v',
+          'libx264',
+          '-preset',
+          'fast',
+          '-crf',
+          '18',
+          '-profile:v',
+          'high',
+          '-level',
+          '4.2',
+          '-pix_fmt',
+          'yuv420p',
+          '-c:a',
+          'aac',
+          '-b:a',
+          '192k',
+          '-ar',
+          '48000',
+          '-movflags',
+          '+faststart',
+          'version_b.mp4',
+        ],
+        jobDir,
+      );
+    }
   } else {
-    await runCommand(
-      'ffmpeg',
-      [
-        '-y',
-        '-i',
-        masterVideoFileName,
-        '-i',
-        'main_audio.wav',
-        '-f',
-        'lavfi',
-        '-t',
-        String(endplateDurationSec),
-        '-i',
-        'anullsrc=channel_layout=stereo:sample_rate=48000',
-        '-filter_complex',
-        '[1:a][2:a]concat=n=2:v=0:a=1[aout]',
-        '-map',
-        '0:v',
-        '-map',
-        '[aout]',
-        '-c:v',
-        'libx264',
-        '-preset',
-        'fast',
-        '-crf',
-        '18',
-        '-profile:v',
-        'high',
-        '-level',
-        '4.2',
-        '-pix_fmt',
-        'yuv420p',
-        '-c:a',
-        'aac',
-        '-b:a',
-        '192k',
-        '-ar',
-        '48000',
-        '-movflags',
-        '+faststart',
-        'version_b.mp4',
-      ],
-      jobDir,
-    );
+    report(5, 'Пропуск Версии Б', 'Режим экспорта: только Версия А');
   }
 
-  // Step 6: Build Version A (копируем уже закодированный видеопоток из version_b.mp4 + микс аудио/логотипа + то же рекламное аудио)
+  // Step 6: Build Version A (копируем видеопоток из version_b.mp4 при двойном экспорте либо кодируем напрямую из masterVideoFileName)
   report(6, 'Сборка Версии А (MP4 H.264/AAC)', 'Оригинальная речь + музыка + звуковой логотип');
   const musicAsset = useUploadedMusic ? assets.music : undefined;
   const fadeOutStart = Math.max(0, endplateDurationSec - 0.25);
+  const versionAVideoSource = includeVersionB ? 'version_b.mp4' : masterVideoFileName;
+  const versionAVideoArgs = includeVersionB
+    ? ['-c:v', 'copy']
+    : ['-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-profile:v', 'high', '-level', '4.2', '-pix_fmt', 'yuv420p'];
 
   if (musicAsset && fs.existsSync(musicAsset.filePath)) {
     const musicFadeOut = Math.max(0, mainDurationSec - 0.6);
     const verAInputs = [
       '-y',
       '-i',
-      'version_b.mp4',
+      versionAVideoSource,
       '-i',
       'main_audio.wav',
       '-stream_loop',
@@ -950,9 +1026,8 @@ export async function renderDualShortsExport(params: {
         '0:v',
         '-map',
         '[aout]',
-        ...(adAudioMasterPath ? ['-t', totalDurationExactSec.toFixed(3)] : []),
-        '-c:v',
-        'copy',
+        ...(adAudioMasterPath || !includeVersionB ? ['-t', totalDurationExactSec.toFixed(3)] : []),
+        ...versionAVideoArgs,
         '-c:a',
         'aac',
         '-b:a',
@@ -969,7 +1044,7 @@ export async function renderDualShortsExport(params: {
     const verAInputs = [
       '-y',
       '-i',
-      'version_b.mp4',
+      versionAVideoSource,
       '-i',
       'main_audio.wav',
       '-t',
@@ -1002,9 +1077,8 @@ export async function renderDualShortsExport(params: {
         '0:v',
         '-map',
         '[aout]',
-        ...(adAudioMasterPath ? ['-t', totalDurationExactSec.toFixed(3)] : []),
-        '-c:v',
-        'copy',
+        ...(adAudioMasterPath || !includeVersionB ? ['-t', totalDurationExactSec.toFixed(3)] : []),
+        ...versionAVideoArgs,
         '-c:a',
         'aac',
         '-b:a',
@@ -1020,12 +1094,34 @@ export async function renderDualShortsExport(params: {
   }
 
   const versionAPath = path.join(jobDir, 'version_a.mp4');
-  const versionBPath = path.join(jobDir, 'version_b.mp4');
+  const resolvedShortNumber = normalizeShortNumber(shortNumber, 1);
+  const fileNames = buildShortExportFileNames(resolvedShortNumber);
 
+  if (!includeVersionB) {
+    const probeA = await probeMedia(versionAPath);
+    return {
+      jobId,
+      shortNumber: resolvedShortNumber,
+      createdAt: new Date().toISOString(),
+      mainDurationSec: Number(mainDurationSec.toFixed(2)),
+      endplateDurationSec: Number(endplateDurationSec.toFixed(2)),
+      totalDurationSec: Number((mainDurationSec + endplateDurationSec).toFixed(2)),
+      versionA: {
+        version: 'A',
+        title: 'Версия А — основная (MP4, H.264/AAC, речь + музыка + звуковой логотип)',
+        url: `${exportBaseUrl}/${jobId}/version_a.mp4`,
+        fileName: fileNames.versionA,
+        probe: probeA,
+      },
+    };
+  }
+
+  const versionBPath = path.join(jobDir, 'version_b.mp4');
   const [probeA, probeB] = await Promise.all([probeMedia(versionAPath), probeMedia(versionBPath)]);
 
   return {
     jobId,
+    shortNumber: resolvedShortNumber,
     createdAt: new Date().toISOString(),
     mainDurationSec: Number(mainDurationSec.toFixed(2)),
     endplateDurationSec: Number(endplateDurationSec.toFixed(2)),
@@ -1034,14 +1130,14 @@ export async function renderDualShortsExport(params: {
       version: 'A',
       title: 'Версия А — основная (MP4, H.264/AAC, речь + музыка + звуковой логотип)',
       url: `${exportBaseUrl}/${jobId}/version_a.mp4`,
-      fileName: `delo_v_kadre_short_01_version_A.mp4`,
+      fileName: fileNames.versionA,
       probe: probeA,
     },
     versionB: {
       version: 'B',
       title: 'Версия Б — без музыки (MP4, H.264/AAC, речь + тишина на заставке)',
       url: `${exportBaseUrl}/${jobId}/version_b.mp4`,
-      fileName: `delo_v_kadre_short_01_version_B.mp4`,
+      fileName: fileNames.versionB,
       probe: probeB,
     },
   };

@@ -1,15 +1,29 @@
 import React from 'react';
 import { ArrowDown, ArrowUp, Layers, Plus, SlidersHorizontal, Trash2 } from 'lucide-react';
+import {
+  buildShortExportFileNames,
+  normalizeShortNumber,
+} from '../shared/exportNaming.ts';
+import {
+  formatEpisodeLabel,
+  formatSourceOptionLabel,
+  mapLocalRangeToOriginalSeries,
+  resolveSegmentMediaAsset,
+  sortLibrarySources,
+} from '../shared/sourceLibrary.ts';
 import type {
   AdAssetInfo,
   AdOverlayLayer,
   CutSegment,
   PreloadedOverlay,
+  SegmentAutoFrameResult,
+  SourceLibraryItem,
   UploadedAsset,
 } from '../types.ts';
 
 interface TimelineEditorProps {
   segments: CutSegment[];
+  libraryItems: SourceLibraryItem[];
   selectedSegmentId: string | null;
   onSelectSegment: (id: string) => void;
   onUpdateSegment: (id: string, patch: Partial<CutSegment>) => void;
@@ -23,6 +37,8 @@ interface TimelineEditorProps {
   onOpenAdsTab: (layerId?: string) => void;
   uploadedAssets: Partial<Record<'fragment8' | 'fragment9' | 'music' | 'endplate' | 'audioLogo', UploadedAsset>>;
   preloaded: PreloadedOverlay[];
+  shortNumber?: number;
+  onChangeShortNumber?: (val: number) => void;
   endplateAssetId: string;
   onChangeEndplateAssetId: (id: string) => void;
   endplateDurationSec: number;
@@ -33,6 +49,7 @@ interface TimelineEditorProps {
   onChangeUseUploadedMusic: (val: boolean) => void;
   musicGainDb: number;
   onChangeMusicGainDb: (val: number) => void;
+  autoFrameBySegmentId?: Record<string, SegmentAutoFrameResult>;
 }
 
 function formatSecToTimecode(sec: number): string {
@@ -44,6 +61,7 @@ function formatSecToTimecode(sec: number): string {
 
 export const TimelineEditor: React.FC<TimelineEditorProps> = ({
   segments,
+  libraryItems,
   selectedSegmentId,
   onSelectSegment,
   onUpdateSegment,
@@ -57,6 +75,8 @@ export const TimelineEditor: React.FC<TimelineEditorProps> = ({
   onOpenAdsTab,
   uploadedAssets,
   preloaded,
+  shortNumber = 24,
+  onChangeShortNumber,
   endplateAssetId,
   onChangeEndplateAssetId,
   endplateDurationSec,
@@ -67,7 +87,23 @@ export const TimelineEditor: React.FC<TimelineEditorProps> = ({
   onChangeUseUploadedMusic,
   musicGainDb,
   onChangeMusicGainDb,
+  autoFrameBySegmentId = {},
 }) => {
+  const previewFileNames = buildShortExportFileNames(shortNumber);
+  const sortedLibrary = sortLibrarySources(libraryItems, 'segment');
+  const libraryGroups = (() => {
+    const groups = new Map<string, { label: string; items: SourceLibraryItem[] }>();
+    for (const item of sortedLibrary) {
+      const label = formatEpisodeLabel(item.metadata);
+      const existing = groups.get(label);
+      if (existing) {
+        existing.items.push(item);
+      } else {
+        groups.set(label, { label, items: [item] });
+      }
+    }
+    return Array.from(groups.values());
+  })();
   const montageOverlays = preloaded.filter(
     (p) => p.kind === 'image' && Boolean(p.overlayPlacement),
   );
@@ -118,10 +154,22 @@ export const TimelineEditor: React.FC<TimelineEditorProps> = ({
         {segments.map((seg, idx) => {
           const isSelected = seg.id === selectedSegmentId;
           const segDur = Math.max(0, seg.endSec - seg.startSec);
-          const sourceAsset = uploadedAssets[seg.sourceRole];
+          const sourceAsset = resolveSegmentMediaAsset(seg, sortedLibrary, uploadedAssets);
           const sourceReady = Boolean(sourceAsset);
           const outOfBounds =
             sourceAsset && seg.endSec > sourceAsset.probe.durationSec + 0.05;
+          const seriesRange = mapLocalRangeToOriginalSeries(
+            sourceAsset?.metadata,
+            seg.startSec,
+            seg.endSec,
+          );
+          const selectValue = seg.sourceId
+            ? seg.sourceId
+            : sourceAsset?.sourceId
+              ? sourceAsset.sourceId
+              : seg.sourceRole
+                ? `legacy:${seg.sourceRole}`
+                : '';
 
           return (
             <div
@@ -213,18 +261,57 @@ export const TimelineEditor: React.FC<TimelineEditorProps> = ({
                 onClick={(e) => e.stopPropagation()}
               >
                 <label className="block">
-                  <span className="block text-[11px] text-slate-400 mb-1">Исходник</span>
+                  <span className="block text-[11px] text-slate-400 mb-1">Исходник из библиотеки</span>
                   <select
-                    value={seg.sourceRole}
-                    onChange={(e) =>
-                      onUpdateSegment(seg.id, {
-                        sourceRole: e.target.value as 'fragment8' | 'fragment9',
-                      })
-                    }
+                    value={selectValue}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      if (val === 'legacy:fragment8' || val === 'legacy:fragment9') {
+                        onUpdateSegment(seg.id, {
+                          sourceId: undefined,
+                          sourceRole: val.replace('legacy:', '') as 'fragment8' | 'fragment9',
+                        });
+                      } else if (val) {
+                        onUpdateSegment(seg.id, {
+                          sourceId: val,
+                          sourceRole: undefined,
+                        });
+                      }
+                    }}
                     className="w-full px-2.5 py-1.5 text-xs bg-[#0B0F17] border border-[#1F2937] rounded text-slate-200 focus:outline-none focus:border-slate-500"
                   >
-                    <option value="fragment8">Фрагмент 8 (04:10–04:26)</option>
-                    <option value="fragment9">Фрагмент 9 (00:00–01:15)</option>
+                    {!selectValue && <option value="">Выберите видео из библиотеки…</option>}
+                    {seg.sourceRole && !sourceAsset?.sourceId && (
+                      <option value={`legacy:${seg.sourceRole}`}>
+                        {seg.sourceRole === 'fragment8'
+                          ? uploadedAssets.fragment8
+                            ? `Фрагмент 8: ${uploadedAssets.fragment8.originalName}`
+                            : 'Legacy: Фрагмент 8 (ожидается выбор видео)'
+                          : uploadedAssets.fragment9
+                            ? `Фрагмент 9: ${uploadedAssets.fragment9.originalName}`
+                            : 'Legacy: Фрагмент 9 (ожидается выбор видео)'}
+                      </option>
+                    )}
+                    {seg.sourceId && !sourceAsset && (
+                      <option value={seg.sourceId}>
+                        Удалённый / отсутствующий исходник ({seg.sourceId})
+                      </option>
+                    )}
+                    {libraryGroups.length > 1
+                      ? libraryGroups.map((group) => (
+                          <optgroup key={group.label} label={group.label}>
+                            {group.items.map((item) => (
+                              <option key={item.id} value={item.id}>
+                                {formatSourceOptionLabel(item)}
+                              </option>
+                            ))}
+                          </optgroup>
+                        ))
+                      : sortedLibrary.map((item) => (
+                          <option key={item.id} value={item.id}>
+                            {formatSourceOptionLabel(item)}
+                          </option>
+                        ))}
                   </select>
                 </label>
 
@@ -260,22 +347,64 @@ export const TimelineEditor: React.FC<TimelineEditorProps> = ({
                   />
                 </label>
 
-                <label className="block">
-                  <span className="block text-[11px] text-slate-400 mb-1">
-                    Пан 9:16 (X: {seg.cropOffsetX > 0 ? `+${seg.cropOffsetX}` : seg.cropOffsetX}%)
-                  </span>
+                <div className="block">
+                  <div className="flex items-center justify-between gap-1 text-[11px] text-slate-400 mb-1">
+                    {(() => {
+                      const autoRes = autoFrameBySegmentId[seg.id];
+                      const isAuto = seg.framingMode !== 'manual';
+                      const shownOffset =
+                        isAuto && autoRes ? autoRes.recommendedCropOffsetX : seg.cropOffsetX;
+                      const formatted = shownOffset > 0 ? `+${shownOffset}` : String(shownOffset);
+                      const strategyHint =
+                        autoRes?.strategy === 'multi-face'
+                          ? '2+ лица'
+                          : autoRes?.strategy === 'face-track'
+                            ? 'лицо'
+                            : autoRes?.strategy === 'foreground-fallback'
+                              ? 'силуэт'
+                              : '';
+                      return (
+                        <>
+                          <span className="truncate">
+                            {isAuto
+                              ? `Авто 9:16 (${formatted}%${strategyHint ? ` · ${strategyHint}` : ''})`
+                              : `Ручн. X (${formatted}%)`}
+                          </span>
+                          {!isAuto && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                onUpdateSegment(seg.id, { framingMode: 'auto', cropOffsetX: 0 })
+                              }
+                              className="text-[10px] text-emerald-400 hover:text-emerald-300 shrink-0"
+                            >
+                              Авто
+                            </button>
+                          )}
+                        </>
+                      );
+                    })()}
+                  </div>
                   <input
                     type="range"
                     min={-100}
                     max={100}
                     step={5}
-                    value={seg.cropOffsetX}
+                    value={
+                      seg.framingMode !== 'manual' && autoFrameBySegmentId[seg.id]
+                        ? autoFrameBySegmentId[seg.id].recommendedCropOffsetX
+                        : seg.cropOffsetX
+                    }
                     onChange={(e) =>
-                      onUpdateSegment(seg.id, { cropOffsetX: Number(e.target.value) })
+                      onUpdateSegment(seg.id, {
+                        framingMode: 'manual',
+                        cropOffsetX: Number(e.target.value),
+                      })
                     }
                     className="w-full accent-[#DC2626] mt-1.5"
+                    title="Автоматическое кадрирование с защитой лиц активно по умолчанию. Передвиньте ползунок для ручной фиксации."
                   />
-                </label>
+                </div>
 
                 <label className="block">
                   <span className="block text-[11px] text-slate-400 mb-1">Оверлей PNG</span>
@@ -325,6 +454,31 @@ export const TimelineEditor: React.FC<TimelineEditorProps> = ({
                     )}
                   </select>
                 </label>
+              </div>
+
+              {/* Mapped Original Series Timecodes */}
+              <div
+                className="mt-2.5 pt-2 border-t border-[#1F2937]/70 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-400"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <span className="truncate">
+                  {sourceAsset
+                    ? `Файл: ${sourceAsset.originalName} (${sourceAsset.probe.durationSec.toFixed(1)} с)`
+                    : 'Файл не выбран или не загружен'}
+                </span>
+                {seriesRange ? (
+                  <span
+                    className={`font-mono tabular-nums ${
+                      seriesRange.exceedsClipRange ? 'text-amber-300' : 'text-slate-300'
+                    }`}
+                  >
+                    Таймкод в оригинальной серии: {seriesRange.startTimecode} – {seriesRange.endTimecode}
+                  </span>
+                ) : (
+                  <span className="text-slate-500">
+                    Таймкод в серии: задайте начало фрагмента в метаданных библиотеки
+                  </span>
+                )}
               </div>
             </div>
           );
@@ -460,9 +614,34 @@ export const TimelineEditor: React.FC<TimelineEditorProps> = ({
 
       {/* Endplate & Audio Mix Settings */}
       <div className="bg-[#121826] border border-[#1F2937] rounded-lg p-5 space-y-4">
-        <h3 className="text-sm font-semibold text-slate-100">
-          Финальная заставка и звуковой микс (Версия А / Б)
-        </h3>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h3 className="text-sm font-semibold text-slate-100">
+            Финальная заставка и звуковой микс (Версия А / Б)
+          </h3>
+
+          <div className="flex flex-wrap items-center gap-2.5 text-xs">
+            <label className="flex items-center gap-2 text-slate-300">
+              <span>Номер Shorts №</span>
+              <input
+                type="number"
+                min={1}
+                max={9999}
+                step={1}
+                value={shortNumber}
+                onChange={(e) =>
+                  onChangeShortNumber?.(normalizeShortNumber(e.target.value, 1))
+                }
+                className="w-20 px-2.5 py-1 font-mono tabular-nums bg-[#0B0F17] border border-[#1F2937] rounded text-slate-100 focus:outline-none focus:border-slate-500"
+              />
+            </label>
+            <span
+              className="text-[11px] font-mono text-slate-400"
+              title="Имена итоговых файлов при экспорте"
+            >
+              {previewFileNames.versionA} / {previewFileNames.versionB}
+            </span>
+          </div>
+        </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
           <label className="block">

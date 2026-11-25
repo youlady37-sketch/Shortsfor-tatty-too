@@ -1,6 +1,7 @@
 import React from 'react';
 import { AlertTriangle, CheckCircle2, Download, HardDrive, Loader2, RefreshCw, XCircle } from 'lucide-react';
 import { StorageStatusCard } from './StorageStatusCard.tsx';
+import { resolveSegmentMediaAsset } from '../shared/sourceLibrary.ts';
 import type {
   AdOverlayLayer,
   BrowserVaultDiagnostics,
@@ -10,6 +11,7 @@ import type {
   ExportJobResult,
   ExportVaultBackupState,
   PreloadedOverlay,
+  SourceLibraryItem,
   SourceRole,
   StorageEnvironmentInfo,
   SubtitleCue,
@@ -18,6 +20,7 @@ import type {
 
 interface QualityChecklistProps {
   segments: CutSegment[];
+  libraryItems: SourceLibraryItem[];
   subtitles: SubtitleCue[];
   adLayers: AdOverlayLayer[];
   uploadedAssets: Partial<Record<SourceRole, UploadedAsset>>;
@@ -50,6 +53,7 @@ interface QualityChecklistProps {
 
 export const QualityChecklist: React.FC<QualityChecklistProps> = ({
   segments,
+  libraryItems,
   subtitles,
   adLayers,
   uploadedAssets,
@@ -73,15 +77,21 @@ export const QualityChecklist: React.FC<QualityChecklistProps> = ({
   onDownloadBoth,
   onOpenCleanupModal,
 }) => {
-  const hasFrag8 = Boolean(uploadedAssets.fragment8);
-  const hasFrag9 = Boolean(uploadedAssets.fragment9);
+  const allSegmentsHaveSources =
+    segments.length > 0 &&
+    segments.every((s) => Boolean(resolveSegmentMediaAsset(s, libraryItems, uploadedAssets)));
+  const usedSourcesCount = new Set(
+    segments
+      .map((s) => resolveSegmentMediaAsset(s, libraryItems, uploadedAssets)?.key)
+      .filter((k): k is string => Boolean(k)),
+  ).size;
   const durationValid = totalDurationSec >= 55 && totalDurationSec <= 59;
   const endplateValid = endplateDurationSec >= 1.5 && endplateDurationSec <= 2.0;
 
   const segmentsValid =
     segments.length > 0 &&
     segments.every((s) => {
-      const asset = uploadedAssets[s.sourceRole];
+      const asset = resolveSegmentMediaAsset(s, libraryItems, uploadedAssets);
       if (!asset) return false;
       return s.endSec > s.startSec && s.endSec <= asset.probe.durationSec + 0.05;
     });
@@ -108,12 +118,11 @@ export const QualityChecklist: React.FC<QualityChecklistProps> = ({
   }> = [
     {
       id: 1,
-      label: 'Исходные видеофайлы (Фрагмент 8 и Фрагмент 9)',
-      status: hasFrag8 && hasFrag9 ? 'pass' : 'fail',
-      detail:
-        hasFrag8 && hasFrag9
-          ? 'Оба исходных видеофайла загружены и проверены через ffprobe.'
-          : `Не хватает: ${[!hasFrag8 && 'Фрагмент 8 (00:04:10–00:04:26)', !hasFrag9 && 'Фрагмент 9 (00:00:00–00:01:15)'].filter(Boolean).join(', ')}.`,
+      label: 'Исходные видеофайлы из библиотеки для всех сегментов',
+      status: allSegmentsHaveSources ? 'pass' : 'fail',
+      detail: allSegmentsHaveSources
+        ? `В библиотеке доступно файлов: ${libraryItems.length}; в текущем монтаже задействовано источников: ${usedSourcesCount}.`
+        : 'Для части монтажных сегментов не выбран или не загружен видеофайл из библиотеки.',
     },
     {
       id: 2,
@@ -124,10 +133,10 @@ export const QualityChecklist: React.FC<QualityChecklistProps> = ({
     {
       id: 3,
       label: 'Корректность всех склеек и таймкодов',
-      status: segmentsValid ? 'pass' : hasFrag8 && hasFrag9 ? 'fail' : 'warn',
+      status: segmentsValid ? 'pass' : allSegmentsHaveSources ? 'fail' : 'warn',
       detail: segmentsValid
         ? `Все ${segments.length} монтажных сегментов укладываются в границы загруженных файлов.`
-        : 'Проверьте границы In/Out после загрузки исходных видеофайлов.',
+        : 'Проверьте границы In/Out и привязку исходников на вкладке «Монтаж».',
     },
     {
       id: 4,
@@ -139,10 +148,10 @@ export const QualityChecklist: React.FC<QualityChecklistProps> = ({
     },
     {
       id: 5,
-      label: 'Вертикальное кадрирование 9:16 без обрезания лиц',
-      status: hasFrag8 && hasFrag9 ? 'pass' : 'warn',
+      label: 'Вертикальное кадрирование 9:16 с защитой лица и тела',
+      status: allSegmentsHaveSources ? 'pass' : 'warn',
       detail:
-        'Для каждого сегмента доступен горизонтальный сдвиг кадра (X-Pan) с контролем в мониторе 9:16.',
+        'Активно автоматическое распознавание и сглаженное отслеживание лиц и верхней части тела для каждого сегмента (с возможностью ручной коррекции X-Pan).',
     },
     {
       id: 6,
@@ -297,7 +306,9 @@ export const QualityChecklist: React.FC<QualityChecklistProps> = ({
           )}
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {[exportResult.versionA, exportResult.versionB].map((item) => {
+            {[exportResult.versionA, exportResult.versionB]
+              .filter((item): item is NonNullable<typeof item> => Boolean(item))
+              .map((item) => {
               const isDownloadingThis =
                 downloadProgress?.jobId === exportResult.jobId &&
                 downloadProgress?.version === item.version;
@@ -318,6 +329,9 @@ export const QualityChecklist: React.FC<QualityChecklistProps> = ({
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0">
                       <div className="text-xs font-semibold text-slate-100">{item.title}</div>
+                      <div className="text-[11px] font-mono text-slate-300 mt-0.5 truncate">
+                        {item.fileName}
+                      </div>
                       <div className="text-[11px] font-mono tabular-nums text-slate-400 mt-1">
                         {item.probe.videoCodec?.toUpperCase()} / {item.probe.audioCodec?.toUpperCase()} ·{' '}
                         {item.probe.durationSec.toFixed(2)} с ·{' '}
@@ -423,7 +437,7 @@ export const QualityChecklist: React.FC<QualityChecklistProps> = ({
                     <p className="text-xs text-red-300">{item.error}</p>
                   )}
 
-                  {resA && resB && (
+                  {resA && (
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
                       {[
                         {
@@ -435,15 +449,19 @@ export const QualityChecklist: React.FC<QualityChecklistProps> = ({
                           inVault: vaultA,
                           available: canGetA,
                         },
-                        {
-                          ver: 'B' as const,
-                          label: 'Версия Б',
-                          report: resB,
-                          onServer: item.versionBOnServer,
-                          onCloud: item.versionBOnCloud,
-                          inVault: vaultB,
-                          available: canGetB,
-                        },
+                        ...(resB
+                          ? [
+                              {
+                                ver: 'B' as const,
+                                label: 'Версия Б',
+                                report: resB,
+                                onServer: item.versionBOnServer,
+                                onCloud: item.versionBOnCloud,
+                                inVault: vaultB,
+                                available: canGetB,
+                              },
+                            ]
+                          : []),
                       ].map((v) => {
                         const isDownloading =
                           downloadProgress?.jobId === item.jobId &&
